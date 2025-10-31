@@ -1,0 +1,97 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-slate-900 text-slate-100;
+  }
+}
+
+@layer components {
+  .btn {
+    @apply px-4 py-2 rounded-lg font-medium transition-all duration-200
+           flex items-center justify-center gap-2;
+  }
+  
+  .btn-primary {
+    @apply bg-blue-600 text-white hover:bg-blue-700
+           shadow-lg hover:shadow-blue-500/25;
+  }
+  
+  .btn-success {
+    @apply bg-green-600 text-white hover:bg-green-700
+           shadow-lg hover:shadow-green-500/25;
+  }
+  
+  .btn-disabled {
+    @apply bg-slate-600 cursor-not-allowed opacity-60;
+  }
+  
+  .card {
+    @apply bg-slate-800 rounded-lg border border-slate-700 shadow-xl p-6
+           transition-all duration-200 hover:shadow-2xl;
+  }
+  
+  .input {
+    @apply w-full p-3 rounded-lg bg-slate-900 border-2 border-slate-700
+           text-slate-300 focus:border-blue-500 focus:ring-1 focus:ring-blue-500
+           transition-colors;
+  }
+  
+  .label {
+    @apply block text-sm font-medium text-slate-300 mb-2;
+  }
+  
+  .table-container {
+    @apply overflow-x-auto rounded-lg border border-slate-700;
+  }
+  
+  .data-table {
+    @apply min-w-full divide-y divide-slate-700;
+  }
+  
+  .data-table th {
+    @apply px-6 py-3 text-left text-xs font-medium text-slate-400 uppercase tracking-wider;
+  }
+  
+  .data-table td {
+    @apply px-6 py-4 whitespace-nowrap text-sm text-slate-300;
+  }
+  
+  .data-table tr {
+    @apply hover:bg-slate-700/50 transition-colors;
+  }
+
+  .chart-container {
+    @apply h-[300px] w-full;
+  }
+}
+
+@layer utilities {
+  .animate-spin {
+    animation: spin 1s linear infinite;
+  }
+  
+  @keyframes spin {
+    from {
+      transform: rotate(0deg);
+    }
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  
+  .animate-pulse {
+    animation: pulse 2s infinite;
+  }
+  
+  @keyframes pulse {
+    0%, 100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.5;
+    }
+  }
+}
