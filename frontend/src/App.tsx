@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { Stats } from '@/components/Stats';
 import { Charts } from '@/components/Charts';
 import { IpTables } from '@/components/IpTables';
-import { PacketTable } from '@/components/PacketTable';
+import PacketTable from '@/components/PacketTable'; // Corrected import
 import NetworkGraph from '@/components/NetworkGraph';
 import { UploadCard } from '@/components/UploadCard';
 import { ShieldCheck, Upload, BarChart2, Table, GitMerge } from 'lucide-react';

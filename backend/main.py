@@ -209,13 +209,16 @@ async def analyze_pcap(file_id: str):
 
 def process_packets_sync(file_path: str, limit: int):
     """Synchronous function to process packets, to be run in a thread pool."""
+    print(f"[DEBUG] process_packets_sync called with file_path: {file_path}, limit: {limit}")
     cap = None
     try:
         cap = pyshark.FileCapture(file_path)
         packets = []
-        
+        print(f"[DEBUG] pyshark.FileCapture successful for {file_path}")
+
         for i, packet in enumerate(cap):
             if i >= limit:
+                print(f"[DEBUG] Limit {limit} reached, breaking loop.")
                 break
                 
             packet_info = {
@@ -231,7 +234,9 @@ def process_packets_sync(file_path: str, limit: int):
                 packet_info["dst_ip"] = packet.ip.dst
             
             packets.append(packet_info)
+            # print(f"[DEBUG] Appended packet {i+1}: {packet_info}") # Too verbose, uncomment if needed
         
+        print(f"[DEBUG] Finished processing packets. Total packets found: {len(packets)}")
         return {"packets": packets, "total_returned": len(packets)}
     finally:
         if cap:
