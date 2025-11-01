@@ -3,9 +3,9 @@ uvicorn==0.24.0
 pyshark==0.6
 python-multipart==0.0.6
 sqlalchemy==2.0.23
-psycopg2-binary==2.9.9
 pydantic==2.5.0
 python-jose==3.3.0
 passlib==1.7.4
 bcrypt==4.1.1
 aiofiles==23.2.1
+clickhouse-connect==0.7.1

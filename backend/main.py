@@ -1,13 +1,16 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
-import pyshark
 from datetime import datetime
 import os
 from pathlib import Path
 import uuid
-from typing import List, Dict
+from typing import List, Dict, Any
 import shutil
+import json
+
+from .database import ch_client
+from .pcap_parser import parse_and_ingest_pcap_sync
 
 app = FastAPI(title="PCAP Analyzer API")
 
@@ -21,12 +24,11 @@ app.add_middleware(
 )
 
 # --- Configuration ---
-# Use a path relative to this file for robustness
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-# Configuration
+# --- API Endpoints ---
 
 @app.get("/")
 async def root():
@@ -34,340 +36,244 @@ async def root():
 
 @app.post("/api/upload")
 async def upload_pcap(file: UploadFile = File(...)):
-    """Upload PCAP file"""
-    if not file.filename.endswith(('.pcap', '.pcapng')):
+    """Upload PCAP file, parse, and ingest into ClickHouse."""
+    if not file.filename.endswith((".pcap", ".pcapng")):
         raise HTTPException(status_code=400, detail="Invalid file format. Only .pcap and .pcapng allowed")
     
-    # Generate unique filename
-    file_id = str(uuid.uuid4())
-    # Store all files with a consistent extension for easier lookup
+    file_id = uuid.uuid4()
     saved_filename = f"{file_id}.pcap"
     file_path = UPLOAD_DIR / saved_filename
     
-    # Save file by streaming to avoid high memory usage
     with file_path.open("wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     
-    file_size = file_path.stat().st_size
-    
-    return {
-        "file_id": file_id,
-        "filename": file.filename,
-        "size": file_size,
-        "path": str(file_path)
-    }
+    try:
+        ingestion_result = await run_in_threadpool(parse_and_ingest_pcap_sync, file_path, file_id, file.filename)
+        return {"file_id": str(file_id), "filename": file.filename, "size": ingestion_result["total_bytes"], "path": str(file_path)}
+    except Exception as e:
+        # Clean up the file if ingestion fails
+        if file_path.exists():
+            file_path.unlink()
+        raise HTTPException(status_code=500, detail=f"PCAP ingestion failed: {e}")
 
 @app.get("/api/files", response_model=List[Dict])
 async def list_pcap_files():
-    """List all uploaded PCAP files."""
-    files = []
-    for file_path in UPLOAD_DIR.glob("*.pcap"):
-        try:
-            stats = file_path.stat()
+    """List all uploaded PCAP files from metadata."""
+    try:
+        result = ch_client.query("SELECT id, file_name, upload_time, total_packets, file_size, capture_duration FROM pcap_metadata ORDER BY upload_time DESC")
+        files = []
+        for row in result.result_rows:
             files.append({
-                "file_id": file_path.stem,
-                "size": stats.st_size,
-                "modified_time": datetime.fromtimestamp(stats.st_mtime).isoformat()
+                "file_id": str(row[0]),
+                "filename": row[1],
+                "upload_time": row[2].isoformat(),
+                "total_packets": row[3],
+                "total_bytes": row[4],
+                "capture_duration": row[5]
             })
-        except FileNotFoundError:
-            # File might have been deleted between glob and stat
-            continue
-    # Sort files by modification time, newest first
-    return sorted(files, key=lambda x: x["modified_time"], reverse=True)
+        return files
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve file list: {e}")
 
 @app.delete("/api/files/{file_id}")
 async def delete_pcap_file(file_id: str):
-    """Delete a specific PCAP file."""
-    if not is_safe_path(file_id):
-        raise HTTPException(status_code=400, detail="Invalid file_id format")
-    file_path = UPLOAD_DIR / f"{file_id}.pcap"
-    if not file_path.is_file():
-        raise HTTPException(status_code=404, detail="PCAP file not found")
-    file_path.unlink()
-    return {"message": f"File {file_id} deleted successfully."}
-
-def is_safe_path(file_id: str) -> bool:
-    """Ensure file_id is a simple filename to prevent path traversal."""
-    return not ("/" in file_id or "\\" in file_id or ".." in file_id)
-
-def analyze_pcap_sync(file_path: str):
-    """Synchronous function to analyze pcap, to be run in a thread pool."""
-    cap = None
+    """Delete a specific PCAP file's data from ClickHouse and the file itself."""
     try:
-        # Open PCAP file
-        cap = pyshark.FileCapture(file_path)
+        # Delete from packets table
+        ch_client.command(f"ALTER TABLE packets DELETE WHERE pcap_id = '{file_id}'")
+        # Delete from metadata table
+        ch_client.command(f"ALTER TABLE pcap_metadata DELETE WHERE id = '{file_id}'")
         
-        # Basic analysis
-        packet_count = 0
-        protocols = {}
-        src_ips = {}
-        dst_ips = {}
-        src_ip_bytes = {}
-        dst_ip_bytes = {}
-        total_bytes = 0
-        
-        # Time-series data
-        traffic_over_time = {}
-        start_time = None
-        end_time = None
+        # Delete the actual pcap file from disk (if it still exists)
+        file_path = UPLOAD_DIR / f"{file_id}.pcap"
+        if file_path.is_file():
+            file_path.unlink()
 
-        # Use a generator to avoid loading all packets into memory
-        for packet in cap: # This is blocking
-            packet_count += 1
-            
-            # Get timestamp for time-series analysis
-            if hasattr(packet, 'sniff_time'):
-                current_time = packet.sniff_time
-                if start_time is None:
-                    start_time = current_time
-                end_time = current_time
-                
-                # Round to nearest second for grouping
-                timestamp_second = current_time.replace(microsecond=0)
-                traffic_over_time[timestamp_second] = traffic_over_time.get(timestamp_second, 0) + 1
-
-            # Protocol distribution
-            if hasattr(packet, 'highest_layer'):
-                protocol = packet.highest_layer
-                protocols[protocol] = protocols.get(protocol, 0) + 1
-            
-            # IP analysis
-            if hasattr(packet, 'ip'):
-                src = packet.ip.src
-                dst = packet.ip.dst
-                length = int(packet.length) # packet.length is a string
-                
-                src_ips[src] = src_ips.get(src, 0) + 1
-                dst_ips[dst] = dst_ips.get(dst, 0) + 1
-                src_ip_bytes[src] = src_ip_bytes.get(src, 0) + length
-                dst_ip_bytes[dst] = dst_ip_bytes.get(dst, 0) + length
-                total_bytes += length
-            
-            # Limit processing for demo (first 1000 packets)
-            if packet_count >= 1000:
-                break
-        
-        # Convert time-series data to a sorted list of dicts
-        sorted_traffic_over_time = sorted(
-            [{ "time": k.isoformat(), "packets": v } for k, v in traffic_over_time.items()],
-            key=lambda x: x["time"]
-        )
-
-        capture_duration = "N/A"
-        if start_time and end_time:
-            duration_seconds = (end_time - start_time).total_seconds()
-            capture_duration = f"{duration_seconds:.2f} seconds"
-
-        return packet_count, protocols, src_ips, dst_ips, src_ip_bytes, dst_ip_bytes, total_bytes, sorted_traffic_over_time, capture_duration
-    finally:
-        if cap:
-            cap.close()
+        return {"message": f"Data for file {file_id} deleted successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete file data: {e}")
 
 @app.get("/api/analyze/{file_id}")
 async def analyze_pcap(file_id: str):
-    """Analyze PCAP file and return basic statistics"""
-    
-    if not is_safe_path(file_id):
-        raise HTTPException(status_code=400, detail="Invalid file_id")
-
-    file_path = UPLOAD_DIR / f"{file_id}.pcap"
-    if not file_path.is_file():
-        raise HTTPException(status_code=404, detail="PCAP file not found")
-    
+    """Analyze PCAP data from ClickHouse and return statistics."""
     try:
-        # Run the blocking analysis in a thread pool
-        packet_count, protocols, src_ips, dst_ips, src_ip_bytes, dst_ip_bytes, total_bytes, traffic_over_time, capture_duration = await run_in_threadpool(
-            analyze_pcap_sync, str(file_path)
-        )
-        
-        # Get top talkers
-        top_src = []
-        for ip, count in sorted(src_ips.items(), key=lambda x: x[1], reverse=True)[:10]:
-            bytes_sent = src_ip_bytes.get(ip, 0)
-            percentage = (bytes_sent / total_bytes * 100) if total_bytes > 0 else 0
-            top_src.append({"ip": ip, "packets": count, "bytes": bytes_sent, "percentage": f"{percentage:.2f}%"})
+        # Get total packets and bytes from metadata
+        metadata_result = ch_client.query(f"SELECT total_packets, file_size, capture_duration FROM pcap_metadata WHERE id = '{file_id}'")
+        if not metadata_result.result_rows:
+            raise HTTPException(status_code=404, detail="PCAP metadata not found")
+        total_packets, file_size, capture_duration = metadata_result.result_rows[0]
 
-        top_dst = []
-        for ip, count in sorted(dst_ips.items(), key=lambda x: x[1], reverse=True)[:10]:
-            bytes_received = dst_ip_bytes.get(ip, 0)
-            percentage = (bytes_received / total_bytes * 100) if total_bytes > 0 else 0
-            top_dst.append({"ip": ip, "packets": count, "bytes": bytes_received, "percentage": f"{percentage:.2f}%"})
-        
+        # Protocol distribution
+        protocol_result = ch_client.query(f"SELECT protocol, COUNT() FROM packets WHERE pcap_id = '{file_id}' GROUP BY protocol")
+        protocols = {row[0]: row[1] for row in protocol_result.result_rows}
+
+        # Top sources
+        top_src_result = ch_client.query(f"SELECT src_ip, COUNT() AS packets, SUM(length) AS bytes FROM packets WHERE pcap_id = '{file_id}' GROUP BY src_ip ORDER BY packets DESC LIMIT 10")
+        top_sources = []
+        for row in top_src_result.result_rows:
+            percentage = (row[2] / file_size * 100) if file_size > 0 else 0 # Use file_size here
+            top_sources.append({"ip": str(row[0]), "packets": row[1], "bytes": row[2], "percentage": f"{percentage:.2f}%"})
+
+        # Top destinations
+        top_dst_result = ch_client.query(f"SELECT dst_ip, COUNT() AS packets, SUM(length) AS bytes FROM packets WHERE pcap_id = '{file_id}' GROUP BY dst_ip ORDER BY packets DESC LIMIT 10")
+        top_destinations = []
+        for row in top_dst_result.result_rows:
+            percentage = (row[2] / file_size * 100) if file_size > 0 else 0 # Use file_size here
+            top_destinations.append({"ip": str(row[0]), "packets": row[1], "bytes": row[2], "percentage": f"{percentage:.2f}%"})
+
+        # Traffic over time (e.g., per second or minute)
+        # For simplicity, let's aggregate per second for now
+        traffic_over_time_result = ch_client.query(f"SELECT toStartOfSecond(ts) AS time_sec, COUNT() AS packets FROM packets WHERE pcap_id = '{file_id}' GROUP BY time_sec ORDER BY time_sec ASC")
+        traffic_over_time = [{
+            "time": row[0].isoformat(),
+            "packets": row[1]
+        } for row in traffic_over_time_result.result_rows]
+
         return {
             "file_id": file_id,
-            "packet_count": packet_count,
+            "packet_count": total_packets,
             "protocols": protocols,
-            "top_sources": top_src,
-            "top_destinations": top_dst,
+            "top_sources": top_sources,
+            "top_destinations": top_destinations,
             "traffic_over_time": traffic_over_time,
             "capture_duration": capture_duration,
-            "total_bytes": total_bytes
+            "total_bytes": file_size # Use file_size here
         }
-        
+
+    except HTTPException:
+        raise # Re-raise 404
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
-
-def process_packets_sync(file_path: str, limit: int):
-    """Synchronous function to process packets, to be run in a thread pool."""
-    print(f"[DEBUG] process_packets_sync called with file_path: {file_path}, limit: {limit}")
-    cap = None
-    try:
-        cap = pyshark.FileCapture(file_path)
-        packets = []
-        print(f"[DEBUG] pyshark.FileCapture successful for {file_path}")
-
-        for i, packet in enumerate(cap):
-            if i >= limit:
-                print(f"[DEBUG] Limit {limit} reached, breaking loop.")
-                break
-                
-            packet_info = {
-                "number": i + 1,
-                "time": str(packet.sniff_time) if hasattr(packet, 'sniff_time') else "N/A",
-                "protocol": packet.highest_layer if hasattr(packet, 'highest_layer') else "Unknown",
-                "length": packet.length if hasattr(packet, 'length') else 0,
-            }
-            
-            # Add IP info if available
-            if hasattr(packet, 'ip'):
-                packet_info["src_ip"] = packet.ip.src
-                packet_info["dst_ip"] = packet.ip.dst
-            
-            packets.append(packet_info)
-            # print(f"[DEBUG] Appended packet {i+1}: {packet_info}") # Too verbose, uncomment if needed
-        
-        print(f"[DEBUG] Finished processing packets. Total packets found: {len(packets)}")
-        return {"packets": packets, "total_returned": len(packets)}
-    finally:
-        if cap:
-            cap.close()
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
 
 @app.get("/api/packets/{file_id}")
-async def get_packets(file_id: str, limit: int = 100):
-    """Get packet details"""
-    
-    if not is_safe_path(file_id):
-        raise HTTPException(status_code=400, detail="Invalid file_id")
-
-    file_path = UPLOAD_DIR / f"{file_id}.pcap"
-    if not file_path.is_file():
-        raise HTTPException(status_code=404, detail="PCAP file not found")
-    
+async def get_packets(file_id: str, limit: int = 100, offset: int = 0):
+    """Get packet details from ClickHouse with pagination."""
     try:
-        # Run the blocking pyshark code in a thread pool
-        result = await run_in_threadpool(process_packets_sync, str(file_path), limit)
-        return result
+        query = f"""
+SELECT 
+    ts, pcap_id, packet_number, src_ip, dst_ip, src_port, dst_port, protocol, length, file_offset, info, layers_json 
+    FROM packets 
+    WHERE pcap_id = '{file_id}' 
+    ORDER BY ts ASC, packet_number ASC 
+    LIMIT {limit} OFFSET {offset}"""
+        result = ch_client.query(query)
         
+        packets = []
+        for row in result.result_rows:
+            packets.append({
+                "time": row[0].isoformat(),
+                "pcap_id": str(row[1]),
+                "number": row[2], # packet_number from DB
+                "src_ip": str(row[3]),
+                "dst_ip": str(row[4]),
+                "src_port": row[5],
+                "dst_port": row[6],
+                "protocol": row[7],
+                "length": row[8],
+                "file_offset": row[9],
+                "info": row[10],
+                "layers_json": row[11]
+            })
+        
+        # Get total count for pagination metadata
+        total_count_result = ch_client.query(f"SELECT COUNT() FROM packets WHERE pcap_id = '{file_id}'")
+        total_returned = total_count_result.result_rows[0][0]
+
+        return {"packets": packets, "total_returned": total_returned}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to read packets: {str(e)}")
-
-def get_packet_detail_sync(file_path: str, packet_number: int):
-    """Synchronous function to get the full detail of a single packet."""
-    cap = None
-    try:
-        # We only need to load one packet, so this should be fast.
-        # The packet number from the UI is 1-based, pyshark is 0-based.
-        cap = pyshark.FileCapture(file_path)
-        packet = cap[packet_number - 1]
-
-        packet_details = {
-            "number": packet.number,
-            "sniff_time": str(packet.sniff_time),
-            "length": packet.length,
-            "layers": []
-        }
-
-        for layer in packet.layers:
-            layer_info = {
-                "name": layer.layer_name.upper(),
-                "fields": {}
-            }
-            # To get the values, we can create a dictionary from field names
-            for field in layer.field_names:
-                layer_info["fields"][field] = getattr(layer, field)
-            packet_details["layers"].append(layer_info)
-            
-        return packet_details
-
-    except IndexError:
-        raise HTTPException(status_code=404, detail=f"Packet number {packet_number} not found in capture.")
-    finally:
-        if cap:
-            cap.close()
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve packets: {e}")
 
 @app.get("/api/packet/{file_id}/{packet_number}")
 async def get_packet_detail(file_id: str, packet_number: int):
-    """Get full details for a single packet."""
-    if not is_safe_path(file_id):
-        raise HTTPException(status_code=400, detail="Invalid file_id")
-
-    file_path = UPLOAD_DIR / f"{file_id}.pcap"
-    if not file_path.is_file():
-        raise HTTPException(status_code=404, detail="PCAP file not found")
-
+    """Get full details for a single packet from ClickHouse."""
     try:
-        result = await run_in_threadpool(get_packet_detail_sync, str(file_path), packet_number)
-        return result
+        query = f"""
+SELECT 
+    ts, pcap_id, packet_number, src_ip, dst_ip, src_port, dst_port, protocol, length, file_offset, info, layers_json 
+    FROM packets 
+    WHERE pcap_id = '{file_id}' AND packet_number = {packet_number}"""
+        result = ch_client.query(query)
+        
+        if not result.result_rows:
+            raise HTTPException(status_code=404, detail=f"Packet {packet_number} not found for file {file_id}")
+        
+        row = result.result_rows[0]
+        packet_detail = {
+            "time": row[0].isoformat(),
+            "pcap_id": str(row[1]),
+            "number": row[2],
+            "src_ip": str(row[3]),
+            "dst_ip": str(row[4]),
+            "src_port": row[5],
+            "dst_port": row[6],
+            "protocol": row[7],
+            "length": row[8],
+            "file_offset": row[9],
+            "info": row[10],
+            "layers": json.loads(row[11]) if row[11] else []
+        }
+        return packet_detail
+    except HTTPException:
+        raise # Re-raise 404
     except Exception as e:
-        # Re-raise HTTPException from the sync function or handle other errors
-        if isinstance(e, HTTPException):
-            raise e
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve packet detail: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve packet detail: {e}")
 
-def get_conversations_sync(file_path: str):
-    """Synchronous function to get conversations, to be run in a thread pool."""
-    cap = None
+def get_conversations_from_clickhouse(file_id: str):
+    """Get network conversations for graph visualization from ClickHouse."""
     try:
-        cap = pyshark.FileCapture(file_path)
-        conversations = {}
-        for packet in cap:
-            if hasattr(packet, 'ip'):
-                src = packet.ip.src
-                dst = packet.ip.dst
-                # Store conversations uniquely, regardless of direction
-                key = tuple(sorted((src, dst)))
-                conversations[key] = conversations.get(key, 0) + 1
+        # Aggregate conversations
+        conversation_result = ch_client.query(f"""
+SELECT 
+    src_ip, dst_ip, COUNT() AS packet_count 
+    FROM packets 
+    WHERE pcap_id = '{file_id}' 
+    GROUP BY src_ip, dst_ip"""
+        )
         
         nodes = []
         edges = []
         ip_to_id = {}
+        node_id_counter = 0
         
         # Create nodes and edges from conversations
-        for (src, dst), count in conversations.items():
+        for row in conversation_result.result_rows:
+            src = str(row[0])
+            dst = str(row[1])
+            count = row[2]
+
+            # Ensure consistent node IDs regardless of direction
             if src not in ip_to_id:
-                ip_to_id[src] = len(ip_to_id)
-                nodes.append({"id": ip_to_id[src], "label": src})
+                ip_to_id[src] = node_id_counter
+                nodes.append({"id": str(node_id_counter), "label": src})
+                node_id_counter += 1
             if dst not in ip_to_id:
-                ip_to_id[dst] = len(ip_to_id)
-                nodes.append({"id": ip_to_id[dst], "label": dst})
+                ip_to_id[dst] = node_id_counter
+                nodes.append({"id": str(node_id_counter), "label": dst})
+                node_id_counter += 1
             
             edges.append({
-                "from": ip_to_id[src],
-                "to": ip_to_id[dst],
+                "from": str(ip_to_id[src]),
+                "to": str(ip_to_id[dst]),
                 "value": count,
                 "title": f"{count} packets"
             })
             
         return {"nodes": nodes, "edges": edges}
-    finally:
-        if cap:
-            cap.close()
+    except Exception as e:
+        print(f"Error getting conversations from ClickHouse: {e}")
+        raise e
 
 @app.get("/api/conversations/{file_id}")
 async def get_conversations(file_id: str):
     """Get network conversations for graph visualization."""
-    if not is_safe_path(file_id):
+    if not file_id:
         raise HTTPException(status_code=400, detail="Invalid file_id")
 
-    file_path = UPLOAD_DIR / f"{file_id}.pcap"
-    if not file_path.is_file():
-        raise HTTPException(status_code=404, detail="PCAP file not found")
-
     try:
-        result = await run_in_threadpool(get_conversations_sync, str(file_path))
+        result = await run_in_threadpool(get_conversations_from_clickhouse, file_id)
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get conversations: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get conversations: {e}")
 
 
 if __name__ == "__main__":
