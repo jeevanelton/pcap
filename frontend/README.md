@@ -1,73 +1,58 @@
-# React + TypeScript + Vite
+# Frontend Documentation
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+This document provides a detailed overview of the frontend application.
 
-Currently, two official plugins are available:
+## Overview
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+The frontend is a single-page application (SPA) built with React and TypeScript. It uses Vite for fast development and builds. The UI is styled with Tailwind CSS, and charts are rendered using Recharts.
 
-## React Compiler
+## Project Structure
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+The `src` directory is organized as follows:
 
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```
+src/
+├── assets/           # Static assets like images and SVGs
+├── components/       # Reusable React components
+│   ├── auth/         # Components related to authentication
+│   └── ui/           # Generic UI components (Button, Card, etc.)
+├── contexts/         # React contexts for global state management
+├── hooks/            # Custom React hooks
+├── lib/              # Utility functions
+├── services/         # API service definitions
+├── styles/           # Global and responsive styles
+└── types/            # TypeScript type definitions
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+### Key Components
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+*   `App.tsx`: The main component that handles routing and the overall layout.
+*   `ProjectSelector.tsx`: Allows users to select, create, and delete projects.
+*   `UploadCard.tsx`: Handles file uploads, including progress tracking.
+*   `PacketTable.tsx`: Displays a table of captured packets with pagination.
+*   `NetworkGraph.tsx`: Renders a graph of network conversations using `@xyflow/react`.
+*   `Charts.tsx`: Displays various charts, such as protocol distribution and traffic over time.
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
+## State Management
+
+The application's state is managed using a combination of React's built-in hooks (`useState`, `useEffect`) and the Context API.
+
+*   **`AuthContext.tsx`**: Manages user authentication state, including the JWT token and user information. It provides the `useAuth` hook to access the authentication state and methods like `login`, `signup`, and `logout`.
+*   **`useApi.ts`**: A custom hook for making API requests. It handles loading and error states, making it easy to fetch data from the backend.
+
+## Authentication
+
+Authentication is handled using JSON Web Tokens (JWT). When a user logs in or signs up, the backend issues a JWT, which is stored in the browser's local storage. This token is then sent with every subsequent request to the backend in the `Authorization` header.
+
+The `authFetch` function in `AuthContext.tsx` is a helper that automatically attaches the JWT to API requests. The `authUploadWithProgress` function is a similar helper for file uploads that also provides progress tracking.
+
+## API Interaction
+
+All communication with the backend API is handled through the functions in `AuthContext.tsx` and the `useApi` hook.
+
+The API base URL is configured in `frontend/src/contexts/AuthContext.tsx`.
+
+The primary functions for API interaction are:
+
+*   `authFetch`: For making authenticated GET, POST, DELETE, etc. requests.
+*   `authUploadWithProgress`: For uploading files with progress tracking.

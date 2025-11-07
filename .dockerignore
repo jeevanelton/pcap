@@ -1,0 +1,62 @@
+# Node modules
+node_modules/
+frontend/node_modules/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Build artifacts
+frontend/dist/
+frontend/build/
+dist/
+build/
+
+# Uploads and data
+backend/uploads/
+uploads/
+analysis-results/
+*.pcap
+*.pcapng
+
+# Logs
+*.log
+
+# Environment files
+.env
+.env.local
+
+# Documentation
+*.md
+!README.md
+
+# GeoIP database (will be downloaded)
+*.mmdb
+
+# Backup files
+*.backup
+*-enhanced.*

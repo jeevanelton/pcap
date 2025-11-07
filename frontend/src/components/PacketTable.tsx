@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { DataTable } from './ui/DataTable';
 import PacketDetailModal from './PacketDetailModal';
-import axios from 'axios';
+import { authFetch } from '../contexts/AuthContext';
 
 const API_BASE = 'http://localhost:8000';
 
@@ -46,8 +46,10 @@ const PacketTable: React.FC<PacketTableProps> = ({ fileId, packetsData }) => {
 
   const handleRowClick = async (packet: Packet) => {
     try {
-      const response = await axios.get(`${API_BASE}/api/packet/${fileId}/${packet.number}`);
-      setSelectedPacketDetail(response.data);
+      const response = await authFetch(`${API_BASE}/api/packet/${fileId}/${packet.number}`);
+      if (!response.ok) throw new Error('Failed to fetch packet details');
+      const data = await response.json();
+      setSelectedPacketDetail(data);
       setIsModalOpen(true);
     } catch (error) {
       console.error('Failed to fetch packet details:', error);

@@ -16,7 +16,47 @@ def extract_packet_info(packet: Any, pcap_id: uuid.UUID, packet_num_counter: int
         dst_ip_str = None
         src_port = None
         dst_port = None
-        protocol = packet.highest_layer if hasattr(packet, 'highest_layer') else "Unknown"
+        # Determine protocol with sensible precedence (avoid generic DATA)
+        # Prefer well-known app layers over transport; fall back to transport; never 'DATA'
+        protocol = "Unknown"
+        try:
+            layer_names = [getattr(layer, 'layer_name', '').lower() for layer in getattr(packet, 'layers', [])]
+        except Exception:
+            layer_names = []
+
+        def has_layer(name: str) -> bool:
+            lname = name.lower()
+            return lname in layer_names or hasattr(packet, lname)
+
+        # Application protocols first
+        if has_layer('dns'):
+            protocol = 'DNS'
+        elif has_layer('http'):
+            protocol = 'HTTP'
+        elif any('tls' in n for n in layer_names):
+            protocol = 'TLS'
+        elif any('quic' in n for n in layer_names):
+            protocol = 'QUIC'
+        elif has_layer('icmp'):
+            protocol = 'ICMP'
+        # Transport next
+        elif has_layer('tcp'):
+            protocol = 'TCP'
+        elif has_layer('udp'):
+            protocol = 'UDP'
+        else:
+            # Fallback to highest_layer if available, but normalize to avoid DATA
+            protocol = getattr(packet, 'highest_layer', 'Unknown')
+            if isinstance(protocol, str):
+                protocol = protocol.upper()
+            if protocol == 'DATA':
+                # Map generic DATA to transport if available
+                if has_layer('tcp'):
+                    protocol = 'TCP'
+                elif has_layer('udp'):
+                    protocol = 'UDP'
+                else:
+                    protocol = 'Unknown'
         length = int(packet.length) if hasattr(packet, 'length') else 0
         
         if hasattr(packet, 'ip'):
@@ -86,7 +126,18 @@ def extract_packet_info(packet: Any, pcap_id: uuid.UUID, packet_num_counter: int
         print(f"Error extracting packet info: {e}")
         return None
 
-def parse_and_ingest_pcap_sync(file_path: Path, pcap_id: uuid.UUID, original_filename: str):
+def get_total_packets(file_path: Path) -> int:
+    """Quickly count the number of packets in a PCAP file."""
+    try:
+        cap = pyshark.FileCapture(str(file_path))
+        count = sum(1 for _ in cap)
+        cap.close()
+        return count
+    except Exception as e:
+        print(f"Error counting packets: {e}")
+        return 0
+
+def parse_and_ingest_pcap_sync(file_path: Path, pcap_id: uuid.UUID, original_filename: str, task_id: str, progress_dict: Dict[str, Any]):
     """Synchronously parses a PCAP file and ingests data into ClickHouse."""
     cap = None
     packets_to_insert_dicts = []
@@ -98,6 +149,10 @@ def parse_and_ingest_pcap_sync(file_path: Path, pcap_id: uuid.UUID, original_fil
 
     print(f"[ClickHouse Ingestion] Attempting to open PCAP: {file_path}")
     try:
+        total_packets = get_total_packets(file_path)
+        if total_packets == 0:
+            raise ValueError("PCAP file is empty or could not be read.")
+
         cap = pyshark.FileCapture(str(file_path))
         print(f"[ClickHouse Ingestion] PCAP file opened successfully.")
 
@@ -146,6 +201,10 @@ def parse_and_ingest_pcap_sync(file_path: Path, pcap_id: uuid.UUID, original_fil
                 )
                 print(f"[ClickHouse Ingestion] Inserted {len(rows)} packets. Total: {packet_count}")
                 packets_to_insert_dicts = []
+            
+            # Update progress
+            progress = (packet_num_counter / total_packets) * 100
+            progress_dict[task_id] = {'status': 'processing', 'progress': progress}
 
         # Insert any remaining packets
         if packets_to_insert_dicts:
@@ -197,9 +256,12 @@ def parse_and_ingest_pcap_sync(file_path: Path, pcap_id: uuid.UUID, original_fil
         )
         print(f"[ClickHouse Ingestion] Metadata inserted for {original_filename}")
 
+        progress_dict[task_id] = {'status': 'completed', 'progress': 100, 'file_id': str(pcap_id)}
+
         return {"file_id": str(pcap_id), "total_packets": packet_count, "total_bytes": total_bytes}
 
     except Exception as e:
+        progress_dict[task_id] = {'status': 'error', 'message': str(e)}
         print(f"[ClickHouse Ingestion] Error during ingestion: {e}")
         raise e
     finally:
