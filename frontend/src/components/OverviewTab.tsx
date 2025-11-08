@@ -1,5 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import './OverviewTab.css';
+import { API_BASE_URL } from '../config';
+
+const API_BASE = API_BASE_URL;
 
 interface TrafficPoint { time: string; packets: number; }
 interface OverviewData {
@@ -40,8 +43,6 @@ const cards: CardSpec[] = [
   { key: 'servers', title: 'Servers', description: 'Potential server IPs from inbound connections.', dependsOn: [] },
   { key: 'hosts', title: 'Hosts', description: 'Unique IP hosts identified.', dependsOn: [] },
 ];
-
-const API_BASE = 'http://localhost:8000';
 
 const OverviewTab: React.FC<{ fileId: string }>= ({ fileId }) => {
   const [data, setData] = useState<OverviewData | null>(null);

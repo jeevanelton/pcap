@@ -38,7 +38,10 @@ const FlowGraphEnhanced = ({ fileId }: FlowGraphProps) => {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [zoom, setZoom] = useState(1);
-  const [limit, setLimit] = useState(500);
+  const [limit, setLimit] = useState(1000);
+  const [totalPackets, setTotalPackets] = useState(0);
+  const [loadedPackets, setLoadedPackets] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
   const [timeFormat, setTimeFormat] = useState<'absolute' | 'relative'>('relative');
   const canvasRef = useRef<HTMLDivElement>(null);
   
@@ -61,19 +64,23 @@ const FlowGraphEnhanced = ({ fileId }: FlowGraphProps) => {
   // Protocol visibility
   const [visibleProtocols, setVisibleProtocols] = useState<Set<string>>(new Set());
 
-  const fetchFlowData = async () => {
+  const fetchFlowData = async (appendMode = false) => {
     if (!fileId) return;
     
     setIsLoading(true);
     setError(null);
     
     try {
-      const response = await authFetch(`http://localhost:8000/api/packets/${fileId}?limit=${limit}`);
+      const offset = appendMode ? packets.length : 0;
+      const response = await authFetch(`http://localhost:8000/api/packets/${fileId}?limit=${limit}&offset=${offset}`);
       if (!response.ok) throw new Error('Failed to fetch packets');
       const data = await response.json();
 
+      setTotalPackets(data.total_count || 0);
+      setHasMore(data.has_more || false);
+
       const flowPackets: PacketFlow[] = data.packets.map((p: any, idx: number) => ({
-        no: p.number || p.no || idx + 1,
+        no: p.number || p.no || (offset + idx + 1),
         time: p.time || '',
         timestamp: p.time ? new Date(p.time).getTime() / 1000 : idx * 0.001,
         src: p.src_ip || p.src || 'Unknown',
@@ -85,21 +92,24 @@ const FlowGraphEnhanced = ({ fileId }: FlowGraphProps) => {
         length: p.length || 0,
       }));
 
-      if (flowPackets.length > 0) {
-        const firstTime = flowPackets[0].timestamp;
-        flowPackets.forEach(p => {
+      let allPackets = appendMode ? [...packets, ...flowPackets] : flowPackets;
+
+      if (allPackets.length > 0) {
+        const firstTime = allPackets[0].timestamp;
+        allPackets.forEach(p => {
           p.timestamp = p.timestamp - firstTime;
         });
       }
 
       const uniqueHosts = new Set<string>();
-      flowPackets.forEach(p => {
+      allPackets.forEach(p => {
         uniqueHosts.add(p.src);
         uniqueHosts.add(p.dst);
       });
       const sortedHosts = Array.from(uniqueHosts).sort();
 
-      setPackets(flowPackets);
+      setPackets(allPackets);
+      setLoadedPackets(allPackets.length);
       setHosts(sortedHosts);
       
       // Initialize visible protocols
@@ -114,9 +124,17 @@ const FlowGraphEnhanced = ({ fileId }: FlowGraphProps) => {
   };
 
   useEffect(() => {
-    fetchFlowData();
+    fetchFlowData(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fileId, limit]);
+  }, [fileId]);
+
+  // Reload when limit changes
+  useEffect(() => {
+    if (fileId) {
+      fetchFlowData(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [limit]);
 
   // Filtered packets based on all criteria
   const filteredPackets = useMemo(() => {
@@ -336,7 +354,7 @@ const FlowGraphEnhanced = ({ fileId }: FlowGraphProps) => {
         <div className="text-center p-8 bg-red-50 rounded-2xl border border-red-100">
           <p className="text-red-600 font-medium">{error}</p>
           <button
-            onClick={fetchFlowData}
+            onClick={() => fetchFlowData(false)}
             className="mt-4 inline-flex items-center px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors"
           >
             <RefreshCw className="h-4 w-4 mr-2" />
@@ -380,15 +398,40 @@ const FlowGraphEnhanced = ({ fileId }: FlowGraphProps) => {
         <div className="flex items-center gap-2 flex-wrap">
           {/* Packet Limit */}
           <div className="flex items-center gap-1 bg-gradient-to-r from-purple-50 to-pink-50 rounded-lg px-2 py-1.5 border border-purple-200/50">
-            <span className="text-xs font-medium text-purple-700">Packets:</span>
+            <span className="text-xs font-medium text-purple-700">Load:</span>
             <select
               value={limit}
               onChange={(e) => setLimit(Number(e.target.value))}
               className="text-xs border-0 bg-transparent font-medium text-gray-700 focus:outline-none cursor-pointer"
             >
-              {[50,100,200,500,1000].map(n => <option key={n} value={n}>{n}</option>)}
+              {[500,1000,2000,3000,5000].map(n => <option key={n} value={n}>{n}</option>)}
             </select>
           </div>
+
+          {/* Packet Count Display */}
+          <div className="px-2 py-1 bg-gradient-to-r from-indigo-50 to-blue-50 rounded-lg border border-indigo-200/50">
+            <span className="text-xs font-semibold text-indigo-700">
+              {loadedPackets.toLocaleString()} / {totalPackets.toLocaleString()} packets loaded
+            </span>
+          </div>
+
+          {/* Load More Button */}
+          {hasMore && (
+            <button
+              onClick={() => fetchFlowData(true)}
+              disabled={isLoading}
+              className="text-xs px-3 py-1.5 bg-blue-500 hover:bg-blue-600 text-white rounded-lg font-medium shadow-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+            >
+              {isLoading ? (
+                <>
+                  <RefreshCw className="h-3 w-3 animate-spin" />
+                  Loading...
+                </>
+              ) : (
+                <>Load More</>
+              )}
+            </button>
+          )}
 
           {/* Time Format */}
           <div className="flex items-center gap-1 bg-gradient-to-r from-green-50 to-emerald-50 rounded-lg px-2 py-1.5 border border-green-200/50">
@@ -403,12 +446,6 @@ const FlowGraphEnhanced = ({ fileId }: FlowGraphProps) => {
             </select>
           </div>
 
-          <div className="px-2 py-1 bg-gray-100 rounded-full">
-            <span className="text-[11px] font-semibold text-gray-600">
-              {filteredPackets.length} packets
-            </span>
-          </div>
-          
           {(timeRangeStart !== null && timeRangeEnd !== null) && (
             <button
               onClick={() => { setTimeRangeStart(null); setTimeRangeEnd(null); }}
@@ -805,8 +842,12 @@ const FlowGraphEnhanced = ({ fileId }: FlowGraphProps) => {
             {/* Summary Stats */}
             <div className="grid grid-cols-2 gap-2 text-[10px]">
               <div className="p-2 rounded-lg bg-blue-50 border border-blue-200">
-                <div className="font-semibold text-blue-700">Packets</div>
-                <div className="font-mono text-xs">{analytics.totalPackets}</div>
+                <div className="font-semibold text-blue-700">Loaded</div>
+                <div className="font-mono text-xs">{loadedPackets}</div>
+              </div>
+              <div className="p-2 rounded-lg bg-purple-50 border border-purple-200">
+                <div className="font-semibold text-purple-700">Total</div>
+                <div className="font-mono text-xs">{totalPackets}</div>
               </div>
               <div className="p-2 rounded-lg bg-indigo-50 border border-indigo-200">
                 <div className="font-semibold text-indigo-700">Duration</div>
@@ -816,17 +857,13 @@ const FlowGraphEnhanced = ({ fileId }: FlowGraphProps) => {
                 <div className="font-semibold text-green-700">Bytes</div>
                 <div className="font-mono text-xs">{analytics.totalBytes}</div>
               </div>
-              <div className="p-2 rounded-lg bg-purple-50 border border-purple-200">
-                <div className="font-semibold text-purple-700">Avg Size</div>
+              <div className="p-2 rounded-lg bg-orange-50 border border-orange-200">
+                <div className="font-semibold text-orange-700">Avg Size</div>
                 <div className="font-mono text-xs">{analytics.avgSize.toFixed(1)}</div>
               </div>
-              <div className="p-2 rounded-lg bg-orange-50 border border-orange-200">
-                <div className="font-semibold text-orange-700">PPS</div>
-                <div className="font-mono text-xs">{analytics.pps.toFixed(2)}</div>
-              </div>
               <div className="p-2 rounded-lg bg-pink-50 border border-pink-200">
-                <div className="font-semibold text-pink-700">Avg Δ</div>
-                <div className="font-mono text-xs">{analytics.avgDelta.toFixed(3)}s</div>
+                <div className="font-semibold text-pink-700">PPS</div>
+                <div className="font-mono text-xs">{analytics.pps.toFixed(2)}</div>
               </div>
             </div>
 

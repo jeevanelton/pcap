@@ -9,8 +9,9 @@ from typing import List, Dict, Any
 import shutil
 import json
 
-from .database import ch_client
-from .pcap_parser import parse_and_ingest_pcap_sync
+from database import get_ch_client, wait_for_clickhouse, init_schema
+from config import CH_DATABASE
+from pcap_parser import parse_and_ingest_pcap_sync
 
 # Optional GeoIP support
 try:
@@ -32,14 +33,53 @@ except ImportError:
 
 app = FastAPI(title="PCAP Analyzer API")
 
-from .auth import get_current_user, hash_password, verify_password, create_access_token, get_user_by_email
+from auth import get_current_user, hash_password, verify_password, create_access_token, get_user_by_email
+
+@app.on_event("startup")
+async def _startup():
+    ready = wait_for_clickhouse(max_seconds=45, interval=2)
+    if not ready:
+        print("[Startup] ClickHouse not ready after retries")
+        return
+    try:
+        init_schema()
+        get_ch_client()
+    except Exception as e:
+        print(f"[Startup] Schema init failed: {e}")
+
+# Generic exception handlers to avoid leaking internal details
+from fastapi.responses import JSONResponse
+from starlette.requests import Request
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    # Log full error server-side, send sanitized message to client
+    print(f"[Error] {exc}")
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    # Pass through 4xx details, sanitize 5xx
+    if 400 <= exc.status_code < 500:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    print(f"[HTTPError] {exc.detail}")
+    return JSONResponse(status_code=exc.status_code, content={"detail": "Server error"})
 
 ANALYSIS_PROGRESS: Dict[str, Dict[str, Any]] = {}
+
+# Lightweight proxy so scattered ch_client usages route to the cached client
+class _CHProxy:
+    def query(self, *args, **kwargs):
+        return get_ch_client().query(*args, **kwargs)
+    def command(self, *args, **kwargs):
+        return get_ch_client().command(*args, **kwargs)
+
+ch_client = _CHProxy()
 
 # CORS middleware for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://localhost:5175"],
+    allow_origins=["*"],  # Allow all origins for development
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -74,11 +114,11 @@ class ProjectCreateRequest(BaseModel):
 
 @app.post("/api/auth/signup", response_model=TokenResponse)
 async def signup(payload: SignupRequest):
-    exists = ch_client.query(f"SELECT COUNT() FROM users WHERE email = '{payload.email}'").result_rows[0][0]
+    exists = get_ch_client().query(f"SELECT COUNT() FROM users WHERE email = '{payload.email}'").result_rows[0][0]
     if exists:
         raise HTTPException(status_code=400, detail="Email already registered")
     user_id = str(uuid.uuid4())
-    ch_client.command(
+    get_ch_client().command(
         f"""
         INSERT INTO users (id, email, password_hash) VALUES ('{user_id}', '{payload.email}', '{hash_password(payload.password)}')
         """
@@ -100,19 +140,19 @@ async def me(current_user: dict = Depends(get_current_user)):
 
 @app.get("/api/projects")
 async def list_projects(current_user: dict = Depends(get_current_user)):
-    res = ch_client.query(f"SELECT id, name, created_at FROM projects WHERE user_id = '{current_user['id']}' ORDER BY created_at DESC")
+    res = get_ch_client().query(f"SELECT id, name, created_at FROM projects WHERE user_id = '{current_user['id']}' ORDER BY created_at DESC")
     return [{"id": str(r[0]), "name": r[1], "created_at": r[2].isoformat()} for r in res.result_rows]
 
 @app.post("/api/projects")
 async def create_project(payload: ProjectCreateRequest, current_user: dict = Depends(get_current_user)):
     pid = str(uuid.uuid4())
-    ch_client.command(f"INSERT INTO projects (id, user_id, name) VALUES ('{pid}', '{current_user['id']}', '{payload.name}')")
+    get_ch_client().command(f"INSERT INTO projects (id, user_id, name) VALUES ('{pid}', '{current_user['id']}', '{payload.name}')")
     return {"id": pid, "name": payload.name}
 
 @app.delete("/api/projects/{project_id}")
 async def delete_project(project_id: str, current_user: dict = Depends(get_current_user)):
-    ch_client.command(f"ALTER TABLE pcap_project_map DELETE WHERE user_id = '{current_user['id']}' AND project_id = '{project_id}'")
-    ch_client.command(f"ALTER TABLE projects DELETE WHERE user_id = '{current_user['id']}' AND id = '{project_id}'")
+    get_ch_client().command(f"ALTER TABLE pcap_project_map DELETE WHERE user_id = '{current_user['id']}' AND project_id = '{project_id}'")
+    get_ch_client().command(f"ALTER TABLE projects DELETE WHERE user_id = '{current_user['id']}' AND id = '{project_id}'")
     return {"ok": True}
 
 @app.get("/api/projects/{project_id}/files")
@@ -124,7 +164,7 @@ async def list_project_files(project_id: str, current_user: dict = Depends(get_c
     WHERE map.user_id = '{current_user['id']}' AND map.project_id = '{project_id}'
     ORDER BY m.upload_time DESC
     """
-    res = ch_client.query(query)
+    res = get_ch_client().query(query)
     return [{
         "file_id": str(r[0]),
         "filename": r[1],
@@ -136,48 +176,54 @@ async def list_project_files(project_id: str, current_user: dict = Depends(get_c
 
 @app.post("/api/projects/{project_id}/upload")
 async def upload_pcap_to_project(project_id: str, background_tasks: BackgroundTasks, file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
-    owns = ch_client.query(f"SELECT COUNT() FROM projects WHERE id = '{project_id}' AND user_id = '{current_user['id']}'").result_rows[0][0]
-    if not owns:
-        raise HTTPException(status_code=403, detail="Not authorized for this project")
-    if not file.filename.endswith((".pcap", ".pcapng")):
-        raise HTTPException(status_code=400, detail="Invalid file format. Only .pcap and .pcapng allowed")
-    
-    # Get existing files in this project
-    existing_files = ch_client.query(f"""
-        SELECT pcap_id FROM pcap_project_map 
-        WHERE project_id = '{project_id}' AND user_id = '{current_user['id']}'
-    """).result_rows
-    
-    # Delete old PCAP data and files
-    for (old_pcap_id,) in existing_files:
-        try:
-            # Delete packets
-            ch_client.command(f"ALTER TABLE packets DELETE WHERE pcap_id = '{old_pcap_id}'")
-            # Delete metadata
-            ch_client.command(f"ALTER TABLE pcap_metadata DELETE WHERE id = '{old_pcap_id}'")
-            # Delete mapping
-            ch_client.command(f"ALTER TABLE pcap_project_map DELETE WHERE pcap_id = '{old_pcap_id}'")
-            # Delete file
-            old_file = UPLOAD_DIR / f"{old_pcap_id}.pcap"
-            if old_file.exists():
-                old_file.unlink()
-            print(f"Deleted old PCAP: {old_pcap_id}")
-        except Exception as e:
-            print(f"Error deleting old PCAP {old_pcap_id}: {e}")
-    
-    file_id = uuid.uuid4()
-    task_id = str(uuid.uuid4())
-    saved_filename = f"{file_id}.pcap"
-    file_path = UPLOAD_DIR / saved_filename
+    try:
+        # Authorization and validation
+        owns = get_ch_client().query(
+            f"SELECT COUNT() FROM projects WHERE id = '{project_id}' AND user_id = '{current_user['id']}'"
+        ).result_rows[0][0]
+        if not owns:
+            raise HTTPException(status_code=403, detail="Not authorized for this project")
+        if not file.filename.endswith((".pcap", ".pcapng")):
+            raise HTTPException(status_code=400, detail="Invalid file format. Only .pcap and .pcapng allowed")
 
-    with file_path.open("wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+        # Get existing files in this project
+        existing_files_query = f"SELECT pcap_id FROM pcap_project_map WHERE project_id = '{project_id}' AND user_id = '{current_user['id']}'"
+        existing_files = get_ch_client().query(existing_files_query).result_rows
 
-    ANALYSIS_PROGRESS[task_id] = {"status": "processing", "progress": 0}
-    background_tasks.add_task(parse_and_ingest_pcap_sync, file_path, file_id, file.filename, task_id, ANALYSIS_PROGRESS)
-    ch_client.command(f"INSERT INTO pcap_project_map (pcap_id, project_id, user_id) VALUES ('{file_id}', '{project_id}', '{current_user['id']}')")
+        # Delete old PCAP data and files
+        for (old_pcap_id,) in existing_files:
+            try:
+                get_ch_client().command(f"ALTER TABLE packets DELETE WHERE pcap_id = '{old_pcap_id}'")
+                get_ch_client().command(f"ALTER TABLE pcap_metadata DELETE WHERE id = '{old_pcap_id}'")
+                get_ch_client().command(f"ALTER TABLE pcap_project_map DELETE WHERE pcap_id = '{old_pcap_id}'")
+                old_file = UPLOAD_DIR / f"{old_pcap_id}.pcap"
+                if old_file.exists():
+                    old_file.unlink()
+                print(f"Deleted old PCAP: {old_pcap_id}")
+            except Exception as e:
+                print(f"[Cleanup] Error deleting old PCAP {old_pcap_id}: {e}")
 
-    return {"task_id": task_id, "file_id": str(file_id), "replaced": len(existing_files)}
+        # Save new file
+        file_id = uuid.uuid4()
+        task_id = str(uuid.uuid4())
+        saved_filename = f"{file_id}.pcap"
+        file_path = UPLOAD_DIR / saved_filename
+
+        with file_path.open("wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # Kick off background ingestion and map to project
+        ANALYSIS_PROGRESS[task_id] = {"status": "processing", "progress": 0}
+        background_tasks.add_task(parse_and_ingest_pcap_sync, file_path, file_id, file.filename, task_id, ANALYSIS_PROGRESS)
+        get_ch_client().command(
+            f"INSERT INTO pcap_project_map (pcap_id, project_id, user_id) VALUES ('{file_id}', '{project_id}', '{current_user['id']}')"
+        )
+        return {"task_id": task_id, "file_id": str(file_id), "replaced": len(existing_files)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[Upload] Error: {e}")
+        return {"error": "Upload failed"}
 
 
 @app.get("/api/analyze/status/{task_id}")
@@ -193,27 +239,41 @@ async def get_analysis_status(task_id: str):
 async def root():
     return {"message": "PCAP Analyzer API", "status": "running"}
 
+@app.get("/api/health/schema")
+async def schema_health():
+    """Return current tables and any missing required tables."""
+    client = get_ch_client()
+    existing = [r[0] for r in client.query(f"SHOW TABLES FROM {CH_DATABASE}").result_rows]
+    required = ["users", "projects", "pcap_project_map", "packets", "pcap_metadata"]
+    missing = [t for t in required if t not in existing]
+    return {
+        "database": CH_DATABASE,
+        "tables": existing,
+        "missing": missing,
+        "ok": len(missing) == 0
+    }
+
 @app.post("/api/upload")
 async def upload_pcap(file: UploadFile = File(...)):
-    """Upload PCAP file, parse, and ingest into ClickHouse."""
-    if not file.filename.endswith((".pcap", ".pcapng")):
-        raise HTTPException(status_code=400, detail="Invalid file format. Only .pcap and .pcapng allowed")
-    
-    file_id = uuid.uuid4()
-    saved_filename = f"{file_id}.pcap"
-    file_path = UPLOAD_DIR / saved_filename
-    
-    with file_path.open("wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    
+    """Upload PCAP file, parse, and ingest into ClickHouse (standalone)."""
     try:
-        ingestion_result = await run_in_threadpool(parse_and_ingest_pcap_sync, file_path, file_id, file.filename)
+        if not file.filename.endswith((".pcap", ".pcapng")):
+            raise HTTPException(status_code=400, detail="Invalid file format. Only .pcap and .pcapng allowed")
+        file_id = uuid.uuid4()
+        saved_filename = f"{file_id}.pcap"
+        file_path = UPLOAD_DIR / saved_filename
+        with file_path.open("wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        # Run ingestion in threadpool
+        ingestion_result = await run_in_threadpool(parse_and_ingest_pcap_sync, file_path, file_id, file.filename, str(file_id), ANALYSIS_PROGRESS)
         return {"file_id": str(file_id), "filename": file.filename, "size": ingestion_result["total_bytes"], "path": str(file_path)}
-    except Exception as e:
+    except HTTPException:
+        raise
+    except Exception:
         # Clean up the file if ingestion fails
-        if file_path.exists():
+        if 'file_path' in locals() and file_path.exists():
             file_path.unlink()
-        raise HTTPException(status_code=500, detail=f"PCAP ingestion failed: {e}")
+        return {"error": "Upload failed"}
 
 @app.get("/api/files", response_model=List[Dict])
 async def list_pcap_files(current_user: dict = Depends(get_current_user)):
@@ -226,7 +286,7 @@ async def list_pcap_files(current_user: dict = Depends(get_current_user)):
         WHERE map.user_id = '{current_user['id']}'
         ORDER BY m.upload_time DESC
         """
-        result = ch_client.query(query)
+        result = get_ch_client().query(query)
         files = []
         for row in result.result_rows:
             files.append({
@@ -246,9 +306,9 @@ async def delete_pcap_file(file_id: str, current_user: dict = Depends(get_curren
     """Delete a specific PCAP file's data from ClickHouse and the file itself."""
     try:
         # Delete from packets table
-        ch_client.command(f"ALTER TABLE packets DELETE WHERE pcap_id = '{file_id}'")
+        get_ch_client().command(f"ALTER TABLE packets DELETE WHERE pcap_id = '{file_id}'")
         # Delete from metadata table
-        ch_client.command(f"ALTER TABLE pcap_metadata DELETE WHERE id = '{file_id}'")
+        get_ch_client().command(f"ALTER TABLE pcap_metadata DELETE WHERE id = '{file_id}'")
         
         # Delete the actual pcap file from disk (if it still exists)
         file_path = UPLOAD_DIR / f"{file_id}.pcap"
@@ -264,24 +324,24 @@ async def analyze_pcap(file_id: str, current_user: dict = Depends(get_current_us
     """Analyze PCAP data from ClickHouse and return statistics."""
     try:
         # Get total packets and bytes from metadata
-        metadata_result = ch_client.query(f"SELECT total_packets, file_size, capture_duration FROM pcap_metadata WHERE id = '{file_id}'")
+        metadata_result = get_ch_client().query(f"SELECT total_packets, file_size, capture_duration FROM pcap_metadata WHERE id = '{file_id}'")
         if not metadata_result.result_rows:
             raise HTTPException(status_code=404, detail="PCAP metadata not found")
         total_packets, file_size, capture_duration = metadata_result.result_rows[0]
 
         # Protocol distribution
-        protocol_result = ch_client.query(f"SELECT protocol, COUNT() FROM packets WHERE pcap_id = '{file_id}' GROUP BY protocol")
+        protocol_result = get_ch_client().query(f"SELECT protocol, COUNT() FROM packets WHERE pcap_id = '{file_id}' GROUP BY protocol")
         protocols = {row[0]: row[1] for row in protocol_result.result_rows}
 
         # Top sources
-        top_src_result = ch_client.query(f"SELECT src_ip, COUNT() AS packets, SUM(length) AS bytes FROM packets WHERE pcap_id = '{file_id}' GROUP BY src_ip ORDER BY packets DESC LIMIT 10")
+        top_src_result = get_ch_client().query(f"SELECT src_ip, COUNT() AS packets, SUM(length) AS bytes FROM packets WHERE pcap_id = '{file_id}' GROUP BY src_ip ORDER BY packets DESC LIMIT 10")
         top_sources = []
         for row in top_src_result.result_rows:
             percentage = (row[2] / file_size * 100) if file_size > 0 else 0 # Use file_size here
             top_sources.append({"ip": str(row[0]), "packets": row[1], "bytes": row[2], "percentage": f"{percentage:.2f}%"})
 
         # Top destinations
-        top_dst_result = ch_client.query(f"SELECT dst_ip, COUNT() AS packets, SUM(length) AS bytes FROM packets WHERE pcap_id = '{file_id}' GROUP BY dst_ip ORDER BY packets DESC LIMIT 10")
+        top_dst_result = get_ch_client().query(f"SELECT dst_ip, COUNT() AS packets, SUM(length) AS bytes FROM packets WHERE pcap_id = '{file_id}' GROUP BY dst_ip ORDER BY packets DESC LIMIT 10")
         top_destinations = []
         for row in top_dst_result.result_rows:
             percentage = (row[2] / file_size * 100) if file_size > 0 else 0 # Use file_size here
@@ -289,7 +349,8 @@ async def analyze_pcap(file_id: str, current_user: dict = Depends(get_current_us
 
         # Traffic over time (e.g., per second or minute)
         # For simplicity, let's aggregate per second for now
-        traffic_over_time_result = ch_client.query(f"SELECT toStartOfSecond(ts) AS time_sec, COUNT() AS packets FROM packets WHERE pcap_id = '{file_id}' GROUP BY time_sec ORDER BY time_sec ASC")
+        # Use toStartOfInterval with 1 second instead of toStartOfSecond for DateTime compatibility
+        traffic_over_time_result = get_ch_client().query(f"SELECT toStartOfInterval(ts, INTERVAL 1 second) AS time_sec, COUNT() AS packets FROM packets WHERE pcap_id = '{file_id}' GROUP BY time_sec ORDER BY time_sec ASC")
         traffic_over_time = [{
             "time": row[0].isoformat(),
             "packets": row[1]
@@ -319,7 +380,9 @@ async def overview(file_id: str, current_user: dict = Depends(get_current_user))
     try:
         # Basic metadata
         print(f"Executing meta query for file_id: {file_id}")
-        meta = ch_client.query(f"SELECT total_packets, file_size, capture_duration FROM pcap_metadata WHERE id = '{file_id}'")
+        meta = get_ch_client().query(
+            f"SELECT total_packets, file_size, capture_duration FROM pcap_metadata WHERE id = '{file_id}'"
+        )
         print(f"Meta query result: {meta.result_rows}")
         if not meta.result_rows:
             raise HTTPException(status_code=404, detail="PCAP metadata not found")
@@ -327,43 +390,57 @@ async def overview(file_id: str, current_user: dict = Depends(get_current_user))
 
         # Protocol counts
         print(f"Executing protocols query for file_id: {file_id}")
-        protos_q = ch_client.query(f"SELECT protocol, COUNT() FROM packets WHERE pcap_id = '{file_id}' GROUP BY protocol")
+        protos_q = get_ch_client().query(
+            f"SELECT protocol, COUNT() FROM packets WHERE pcap_id = '{file_id}' GROUP BY protocol"
+        )
         print(f"Protocols query result: {protos_q.result_rows}")
         protocols = {r[0]: r[1] for r in protos_q.result_rows}
 
         # Traffic over time (second resolution)
         print(f"Executing traffic over time query for file_id: {file_id}")
-        traffic_q = ch_client.query(f"SELECT toStartOfSecond(ts) AS t, COUNT() FROM packets WHERE pcap_id = '{file_id}' GROUP BY t ORDER BY t ASC")
+        traffic_q = get_ch_client().query(
+            f"SELECT toStartOfInterval(ts, INTERVAL 1 second) AS t, COUNT() FROM packets WHERE pcap_id = '{file_id}' GROUP BY t ORDER BY t ASC"
+        )
         print(f"Traffic over time query result: {traffic_q.result_rows}")
         traffic = [{"time": r[0].isoformat(), "packets": r[1]} for r in traffic_q.result_rows]
 
         # Unique hosts
         print(f"Executing unique hosts query for file_id: {file_id}")
-        hosts_q = ch_client.query(f"SELECT uniq(ip) FROM (SELECT src_ip AS ip FROM packets WHERE pcap_id='{file_id}' UNION ALL SELECT dst_ip AS ip FROM packets WHERE pcap_id='{file_id}')")
+        hosts_q = get_ch_client().query(
+            f"SELECT uniq(ip) FROM (SELECT src_ip AS ip FROM packets WHERE pcap_id='{file_id}' UNION ALL SELECT dst_ip AS ip FROM packets WHERE pcap_id='{file_id}')"
+        )
         print(f"Unique hosts query result: {hosts_q.result_rows}")
         unique_hosts = hosts_q.result_rows[0][0] if hosts_q.result_rows else 0
 
         # Unique connections (src,dst pairs)
         print(f"Executing connections query for file_id: {file_id}")
-        conns_q = ch_client.query(f"SELECT COUNT() FROM (SELECT src_ip, dst_ip FROM packets WHERE pcap_id='{file_id}' GROUP BY src_ip, dst_ip)")
+        conns_q = get_ch_client().query(
+            f"SELECT COUNT() FROM (SELECT src_ip, dst_ip FROM packets WHERE pcap_id='{file_id}' GROUP BY src_ip, dst_ip)"
+        )
         print(f"Connections query result: {conns_q.result_rows}")
         connections = conns_q.result_rows[0][0] if conns_q.result_rows else 0
 
         # Open ports (unique destination ports >0)
         print(f"Executing open ports query for file_id: {file_id}")
-        open_ports_q = ch_client.query(f"SELECT uniq(dst_port) FROM packets WHERE pcap_id='{file_id}' AND dst_port != 0")
+        open_ports_q = get_ch_client().query(
+            f"SELECT uniq(dst_port) FROM packets WHERE pcap_id='{file_id}' AND dst_port != 0"
+        )
         print(f"Open ports query result: {open_ports_q.result_rows}")
         open_ports = open_ports_q.result_rows[0][0] if open_ports_q.result_rows else 0
 
         # Top destination IPs (heuristic servers)
         print(f"Executing top servers query for file_id: {file_id}")
-        servers_q = ch_client.query(f"SELECT dst_ip, COUNT() AS c, SUM(length) AS b FROM packets WHERE pcap_id='{file_id}' GROUP BY dst_ip ORDER BY c DESC LIMIT 10")
+        servers_q = get_ch_client().query(
+            f"SELECT dst_ip, COUNT() AS c, SUM(length) AS b FROM packets WHERE pcap_id='{file_id}' GROUP BY dst_ip ORDER BY c DESC LIMIT 10"
+        )
         print(f"Top servers query result: {servers_q.result_rows}")
         top_servers = [{"ip": str(r[0]), "packets": r[1], "bytes": r[2]} for r in servers_q.result_rows if str(r[0]) != '0.0.0.0']
 
         # Top destination ports overall
         print(f"Executing top ports query for file_id: {file_id}")
-        top_ports_q = ch_client.query(f"SELECT dst_port, COUNT() AS c FROM packets WHERE pcap_id='{file_id}' AND dst_port != 0 GROUP BY dst_port ORDER BY c DESC LIMIT 10")
+        top_ports_q = get_ch_client().query(
+            f"SELECT dst_port, COUNT() AS c FROM packets WHERE pcap_id='{file_id}' AND dst_port != 0 GROUP BY dst_port ORDER BY c DESC LIMIT 10"
+        )
         print(f"Top ports query result: {top_ports_q.result_rows}")
         top_ports = [{"port": int(r[0]), "count": r[1]} for r in top_ports_q.result_rows]
 
@@ -405,12 +482,15 @@ async def overview(file_id: str, current_user: dict = Depends(get_current_user))
         raise HTTPException(status_code=500, detail=f"Overview failed: {e}")
 
 @app.get("/api/packets/{file_id}")
-async def get_packets(file_id: str, limit: int = 100, offset: int = 0, current_user: dict = Depends(get_current_user)):
-    """Get packet details from ClickHouse with pagination."""
+async def get_packets(file_id: str, limit: int = 1000, offset: int = 0, current_user: dict = Depends(get_current_user)):
+    """Get packet details from ClickHouse with pagination. Default limit increased to 1000 for better UX."""
     try:
+        # Cap max limit to prevent memory issues
+        limit = min(limit, 10000)
+        
         query = f"""
 SELECT 
-    ts, pcap_id, packet_number, src_ip, dst_ip, src_port, dst_port, protocol, length, file_offset, info, layers_json 
+    ts, pcap_id, packet_number, src_ip, dst_ip, src_port, dst_port, protocol, length, file_offset, info 
     FROM packets 
     WHERE pcap_id = '{file_id}' 
     ORDER BY ts ASC, packet_number ASC 
@@ -430,15 +510,20 @@ SELECT
                 "protocol": row[7],
                 "length": row[8],
                 "file_offset": row[9],
-                "info": row[10],
-                "layers_json": row[11]
+                "info": row[10]
             })
         
         # Get total count for pagination metadata
         total_count_result = ch_client.query(f"SELECT COUNT() FROM packets WHERE pcap_id = '{file_id}'")
-        total_returned = total_count_result.result_rows[0][0]
+        total_count = total_count_result.result_rows[0][0]
 
-        return {"packets": packets, "total_returned": total_returned}
+        return {
+            "packets": packets, 
+            "total_count": total_count,
+            "returned_count": len(packets),
+            "offset": offset,
+            "has_more": (offset + len(packets)) < total_count
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to retrieve packets: {e}")
 
@@ -457,6 +542,22 @@ SELECT
             raise HTTPException(status_code=404, detail=f"Packet {packet_number} not found for file {file_id}")
         
         row = result.result_rows[0]
+        layers = json.loads(row[11]) if row[11] else []
+        
+        # Add Frame summary as first layer (like Wireshark)
+        frame_info = {
+            "name": "Frame",
+            "fields": {
+                "frame.number": row[2],
+                "frame.time": row[0].isoformat(),
+                "frame.len": row[8],
+                "frame.protocols": row[7],
+            }
+        }
+        
+        # Prepend frame info to layers
+        all_layers = [frame_info] + layers
+        
         packet_detail = {
             "time": row[0].isoformat(),
             "pcap_id": str(row[1]),
@@ -469,7 +570,7 @@ SELECT
             "length": row[8],
             "file_offset": row[9],
             "info": row[10],
-            "layers": json.loads(row[11]) if row[11] else []
+            "layers": all_layers
         }
         return packet_detail
     except HTTPException:

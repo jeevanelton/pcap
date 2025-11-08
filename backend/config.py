@@ -1,11 +1,25 @@
 import os
 
-# ClickHouse Configuration
-CH_HOST = os.getenv("CH_HOST", "localhost")
-CH_PORT = int(os.getenv("CH_PORT", 8123)) # HTTP port
-CH_USER = os.getenv("CH_USER", "default")
-CH_PASSWORD = os.getenv("CH_PASSWORD", "")
-CH_DATABASE = os.getenv("CH_DATABASE", "pcap_analyzer")
+# ClickHouse Configuration (support multiple env var names)
+CH_HOST = (
+	os.getenv("CH_HOST")
+	or os.getenv("CLICKHOUSE_HOST")
+	or "clickhouse"
+)
+# Prefer explicit HTTP port; fallback to CH_PORT; default 8123 for HTTP client
+CH_PORT = int(
+	os.getenv("CH_PORT")
+	or os.getenv("CLICKHOUSE_HTTP_PORT")
+	or os.getenv("CLICKHOUSE_PORT", 8123)
+)
+CH_USER = os.getenv("CH_USER") or os.getenv("CLICKHOUSE_USER", "default")
+CH_PASSWORD = os.getenv("CH_PASSWORD") or os.getenv("CLICKHOUSE_PASSWORD", "")
+CH_DATABASE = (
+	os.getenv("CH_DATABASE")
+	or os.getenv("CLICKHOUSE_DATABASE")
+	or os.getenv("CLICKHOUSE_DB")
+	or "pcap_db"
+)
 
 # Auth config
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me")

@@ -1,8 +1,9 @@
 // Auth Context and API helpers for JWT token management
 import { createContext, useContext, useState, useEffect } from 'react';
 import type { ReactNode } from 'react';
+import { API_BASE_URL } from '../config';
 
-const API_BASE = 'http://localhost:8000';
+const API_BASE = API_BASE_URL;
 
 interface AuthContextType {
   token: string | null;
@@ -90,9 +91,9 @@ export const authFetch = async (url: string, options: RequestInit = {}) => {
   };
   const res = await fetch(url, { ...options, headers });
   if (res.status === 401) {
-    // Token expired; clear and redirect to login
-    localStorage.removeItem('token');
-    window.location.href = '/';
+    // Token expired or invalid; let the calling function handle it
+    // For now, we'll just return the response and let the caller decide.
+    // In a real app, you might want to trigger a token refresh flow here.
   }
   return res;
 };

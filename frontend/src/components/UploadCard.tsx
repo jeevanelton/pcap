@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react';
 import { Upload, FileSearch, AlertCircle, CheckCircle } from 'lucide-react';
 import { authUploadWithProgress, authFetch } from '../contexts/AuthContext';
+import { API_BASE_URL } from '../config';
 
-const API_BASE = 'http://localhost:8000';
+const API_BASE = API_BASE_URL;
 
 // UI: UploadCard component adapted for the new modal design with project scoping
 export function UploadCard({ projectId, setFileId, setAnalysisData, setPacketsData, setOverviewData, onAnalysisComplete }: any) {

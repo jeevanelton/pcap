@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react';
 import { useAuth, authFetch } from '../contexts/AuthContext';
 import { Plus, FolderOpen, Trash2 } from 'lucide-react';
+import { API_BASE_URL } from '../config';
 
-const API_BASE = 'http://localhost:8000';
+const API_BASE = API_BASE_URL;
 
 interface Project {
   id: string;

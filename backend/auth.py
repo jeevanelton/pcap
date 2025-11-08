@@ -6,8 +6,8 @@ from jose import jwt, JWTError
 from passlib.context import CryptContext
 import uuid
 
-from .config import SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES
-from .database import ch_client
+from config import SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES
+from database import get_ch_client
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
@@ -30,7 +30,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 
 
 def get_user_by_email(email: str):
-    res = ch_client.query(f"SELECT id, email, password_hash, created_at FROM users WHERE email = '{email}' LIMIT 1")
+    res = get_ch_client().query(f"SELECT id, email, password_hash, created_at FROM users WHERE email = '{email}' LIMIT 1")
     if res.result_rows:
         row = res.result_rows[0]
         return {"id": str(row[0]), "email": row[1], "password_hash": row[2], "created_at": row[3]}
@@ -38,7 +38,7 @@ def get_user_by_email(email: str):
 
 
 def get_user_by_id(user_id: str):
-    res = ch_client.query(f"SELECT id, email, password_hash, created_at FROM users WHERE id = '{user_id}' LIMIT 1")
+    res = get_ch_client().query(f"SELECT id, email, password_hash, created_at FROM users WHERE id = '{user_id}' LIMIT 1")
     if res.result_rows:
         row = res.result_rows[0]
         return {"id": str(row[0]), "email": row[1], "password_hash": row[2], "created_at": row[3]}

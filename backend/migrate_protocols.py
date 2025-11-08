@@ -6,7 +6,7 @@ Run this once to clean up existing data
 
 import clickhouse_connect
 import json
-from .config import CH_HOST, CH_PORT, CH_USER, CH_PASSWORD, CH_DATABASE
+from config import CH_HOST, CH_PORT, CH_USER, CH_PASSWORD, CH_DATABASE
 
 # Connect to ClickHouse
 client = clickhouse_connect.get_client(

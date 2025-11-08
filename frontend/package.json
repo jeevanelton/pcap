@@ -10,9 +10,12 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@radix-ui/react-label": "^2.1.8",
+    "@radix-ui/react-slot": "^1.2.4",
     "@types/leaflet": "^1.9.21",
     "@xyflow/react": "^12.9.0",
     "axios": "^1.13.1",
+    "class-variance-authority": "^0.7.1",
     "dagre": "^0.8.5",
     "elkjs": "^0.9.0",
     "html-to-image": "^1.11.13",
@@ -21,7 +24,8 @@
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "react-leaflet": "^5.0.0",
-    "recharts": "^3.3.0"
+    "recharts": "^3.3.0",
+    "tailwind-merge": "^3.3.1"
   },
   "devDependencies": {
     "@eslint/js": "^9.36.0",

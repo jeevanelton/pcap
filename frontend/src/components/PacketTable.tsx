@@ -2,8 +2,9 @@ import React, { useState } from 'react';
 import { DataTable } from './ui/DataTable';
 import PacketDetailModal from './PacketDetailModal';
 import { authFetch } from '../contexts/AuthContext';
+import { API_BASE_URL } from '../config';
 
-const API_BASE = 'http://localhost:8000';
+const API_BASE = API_BASE_URL;
 
 interface Packet {
   number: number; // Added packet number for detail fetching
@@ -20,7 +21,7 @@ interface PacketTableProps {
   packetsData: { packets: Packet[]; total_returned: number }; // Updated to match backend response structure
 }
 
-const columns = [
+const columns: any[] = [
   { header: 'Time', accessor: 'time' },
   { header: 'Source IP', accessor: 'src_ip' },
   { header: 'Destination IP', accessor: 'dst_ip' },

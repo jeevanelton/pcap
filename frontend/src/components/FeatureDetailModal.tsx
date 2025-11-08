@@ -1,8 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import { X, Download, Search, Filter } from 'lucide-react';
 import { authFetch } from '../contexts/AuthContext';
+import { API_BASE_URL } from '../config';
 
-const API_BASE = 'http://localhost:8000';
+const API_BASE = API_BASE_URL;
 
 interface FeatureDetailModalProps {
   featureKey: string;

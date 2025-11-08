@@ -36,7 +36,7 @@ export function Button({
     >
       {isLoading ? (
         <>
-          <LoadingSpinner size="sm" />
+          <LoadingSpinner size="small" />
           <span className="ml-2">Loading...</span>
         </>
       ) : children}

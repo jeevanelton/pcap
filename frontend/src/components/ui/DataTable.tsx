@@ -42,7 +42,7 @@ export function DataTable<T extends object>({ data, columns, className = '', onR
                     className="px-6 py-4 whitespace-nowrap text-sm text-gray-800"
                 >
                   {column.cell 
-                    ? column.cell(row[column.accessor], row)
+                    ? column.cell(row[column.accessor as keyof T])
                     : row[column.accessor] as ReactNode}
                 </td>
               ))}

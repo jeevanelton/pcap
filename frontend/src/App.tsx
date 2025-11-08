@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { ReactFlowProvider } from '@xyflow/react';
 import { Stats } from '@/components/Stats';
 import { Charts } from '@/components/Charts';
-import PacketTable from '@/components/PacketTable';
+import WiresharkViewer from '@/components/WiresharkViewer';
 import NetworkGraph from '@/components/NetworkGraph';
 import FlowGraphEnhanced from '@/components/FlowGraphEnhanced';
 import GeoMap from '@/components/GeoMap';
@@ -13,8 +13,9 @@ import { ShieldCheck, Upload, BarChart2, Table, GitMerge, ArrowLeft, Activity, M
 import { useAuth, authFetch } from './contexts/AuthContext';
 import { AuthScreen } from './components/auth/AuthScreen';
 import { ProjectSelector } from './components/ProjectSelector';
+import { API_BASE_URL } from './config';
 
-const API_BASE = 'http://localhost:8000';
+const API_BASE = API_BASE_URL;
 
 // Card specifications for overview
 interface CardSpec {
@@ -133,10 +134,12 @@ function App() {
         const analysis = await analysisRes.json();
         setAnalysisData(analysis);
 
-        const packetsRes = await authFetch(`${API_BASE}/api/packets/${latestFile.file_id}?limit=50`);
+        // Load initial batch of packets (1000) for better performance
+        // WiresharkViewer and FlowGraph will lazy-load more as needed
+        const packetsRes = await authFetch(`${API_BASE}/api/packets/${latestFile.file_id}?limit=1000`);
         if (!packetsRes.ok) throw new Error('Failed to fetch packets');
-        const packets = await packetsRes.json();
-        setPacketsData(packets);
+        const packetsJson = await packetsRes.json();
+        setPacketsData(packetsJson);
 
         const overviewRes = await authFetch(`${API_BASE}/api/overview/${latestFile.file_id}`);
         if (!overviewRes.ok) throw new Error('Failed to fetch overview');
@@ -350,9 +353,12 @@ function App() {
         );
       case 'Packets':
         return (
-            <div className="bg-white p-6 rounded-2xl shadow-lg border border-gray-100 hover:shadow-xl transition-all duration-300">
-                <h3 className="text-lg font-semibold text-gray-900 mb-4">Packet Table</h3>
-                <PacketTable packetsData={packetsData} fileId={fileId} />
+            <div className="bg-[#1e1e1e] rounded-xl shadow-2xl border border-gray-700 overflow-hidden" style={{ height: 'calc(100vh - 180px)' }}>
+                <WiresharkViewer 
+                  packetsData={packetsData} 
+                  fileId={fileId} 
+                  totalPacketsFromOverview={overviewData?.totals?.packets || 0}
+                />
             </div>
         );
       case 'Network Graph':
