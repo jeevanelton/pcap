@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import './OverviewTab.css';
 import { API_BASE_URL } from '../config';
+import FeatureDetailModal from './FeatureDetailModal';
 
 const API_BASE = API_BASE_URL;
 
@@ -48,6 +49,7 @@ const OverviewTab: React.FC<{ fileId: string }>= ({ fileId }) => {
   const [data, setData] = useState<OverviewData | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [selectedFeature, setSelectedFeature] = useState<CardSpec | null>(null);
 
   useEffect(() => {
     if (!fileId) return;
@@ -60,6 +62,13 @@ const OverviewTab: React.FC<{ fileId: string }>= ({ fileId }) => {
       .catch(e => setError(e.message))
       .finally(() => setLoading(false));
   }, [fileId]);
+
+  const handleCardClick = (card: CardSpec) => {
+    const has = (card.dependsOn||[]).every(proto => data?.protocols[proto] !== undefined);
+    if (has) {
+      setSelectedFeature(card);
+    }
+  };
 
   const totalProtocols = data ? Object.keys(data.protocols).length : 0;
 
@@ -80,7 +89,7 @@ const OverviewTab: React.FC<{ fileId: string }>= ({ fileId }) => {
       <section className="mt-8 grid gap-4 overview-grid">
         {cards.map(c => {
           const has = (c.dependsOn||[]).every(proto => data.protocols[proto] !== undefined);
-          return <div key={c.key} className={`card-tile border border-[#1f2833] rounded-md p-4 bg-[#14181f] flex flex-col ${!has? 'opacity-40':''}`}> 
+          return <div key={c.key} onClick={() => handleCardClick(c)} className={`card-tile border border-[#1f2833] rounded-md p-4 bg-[#14181f] flex flex-col ${!has? 'opacity-40':'cursor-not-allowed'}`}> 
             <div className="flex items-center justify-between mb-2">
               <span className="font-semibold text-sm">{c.title}</span>
               <span className="text-xs px-2 py-0.5 rounded bg-[#1f2833]">{has? (data.categories[c.key] ?? 'Ready') : 'N/A'}</span>
@@ -88,12 +97,20 @@ const OverviewTab: React.FC<{ fileId: string }>= ({ fileId }) => {
             <p className="text-xs leading-relaxed opacity-70 flex-grow">{c.description}</p>
             <div className="mt-3 text-[11px] flex items-center justify-between">
               <span>Protocols: {c.dependsOn && c.dependsOn.length? c.dependsOn.join(', '): 'Any'}</span>
-              {has && <span className="text-cyan-400">View &raquo;</span>}
+              {has && <span className="text-cyan-400 cursor-pointer">View &raquo;</span>}
             </div>
           </div>;
         })}
       </section>
     </>}
+    {selectedFeature && (
+      <FeatureDetailModal
+        featureKey={selectedFeature.key}
+        featureTitle={selectedFeature.title}
+        fileId={fileId}
+        onClose={() => setSelectedFeature(null)}
+      />
+    )}
   </div>;
 };
 

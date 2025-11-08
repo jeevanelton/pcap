@@ -7,6 +7,143 @@ from pathlib import Path
 
 from database import get_ch_client
 
+# DNS query/response type and rcode mappings (Zeek-compatible)
+DNS_QTYPE_MAP = {
+    1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX",
+    16: "TXT", 28: "AAAA", 33: "SRV", 41: "OPT", 43: "DS", 44: "SSHFP",
+    46: "RRSIG", 47: "NSEC", 48: "DNSKEY", 50: "NSEC3", 51: "NSEC3PARAM",
+    52: "TLSA", 257: "CAA", 255: "ANY"
+}
+
+DNS_RCODE_MAP = {
+    0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN", 4: "NOTIMP",
+    5: "REFUSED", 6: "YXDOMAIN", 7: "YXRRSET", 8: "NXRRSET", 9: "NOTAUTH",
+    10: "NOTZONE", 16: "BADVERS"
+}
+
+DNS_QCLASS_MAP = {
+    1: "C_INTERNET", 3: "C_CHAOS", 4: "C_HESIOD", 254: "C_NONE", 255: "C_ANY"
+}
+
+def extract_dns_record(packet: Any, pcap_id: uuid.UUID, timestamp: datetime) -> Optional[Dict[str, Any]]:
+    """Extract Zeek-style DNS log fields from a DNS packet."""
+    try:
+        if not hasattr(packet, 'dns'):
+            return None
+        
+        print(f"[DNS EXTRACTION] Processing packet for DNS data...")
+        dns = packet.dns
+        
+        # Basic packet info
+        src_ip = packet.ip.src if hasattr(packet, 'ip') else (packet.ipv6.src if hasattr(packet, 'ipv6') else '0.0.0.0')
+        dst_ip = packet.ip.dst if hasattr(packet, 'ip') else (packet.ipv6.dst if hasattr(packet, 'ipv6') else '0.0.0.0')
+        src_port = int(packet.udp.srcport) if hasattr(packet, 'udp') else (int(packet.tcp.srcport) if hasattr(packet, 'tcp') else 0)
+        dst_port = int(packet.udp.dstport) if hasattr(packet, 'udp') else (int(packet.tcp.dstport) if hasattr(packet, 'tcp') else 0)
+        proto = "udp" if hasattr(packet, 'udp') else ("tcp" if hasattr(packet, 'tcp') else "unknown")
+        
+        trans_id = int(dns.id, 16) if isinstance(dns.id, str) else int(dns.id)
+        
+        # Query details
+        query = getattr(dns, 'qry_name', '')
+        qtype_raw = getattr(dns, 'qry_type', '1')
+        qclass_raw = getattr(dns, 'qry_class', '1')
+        
+        qtype = int(qtype_raw)
+        qtype_name = DNS_QTYPE_MAP.get(qtype, str(qtype))
+        
+        qclass = int(qclass_raw, 16) if isinstance(qclass_raw, str) else int(qclass_raw)
+        qclass_name = DNS_QCLASS_MAP.get(qclass, str(qclass))
+        
+        # Response code
+        rcode = int(getattr(dns, 'flags_rcode', '0'))
+        rcode_name = DNS_RCODE_MAP.get(rcode, str(rcode))
+        
+        # Flags
+        AA = getattr(dns, 'flags_authoritative', '0') == '1'
+        TC = getattr(dns, 'flags_truncated', '0') == '1'
+        RD = getattr(dns, 'flags_recdesired', '0') == '1'
+        RA = getattr(dns, 'flags_recavail', '0') == '1'
+        
+        # Handle Z flag - pyshark returns string "False"/"True" or "0"/"1"
+        Z_raw = getattr(dns, 'flags_z', '0')
+        if Z_raw in ('True', '1', 1):
+            Z = 1
+        else:
+            Z = 0
+        
+        # Robust answer and TTL extraction
+        answers = []
+        ttls = []
+        
+        # pyshark can present answers in many ways. We need to check for all common attributes.
+        # The `dns.answers` field is often a list of `DNSRR` objects.
+        if hasattr(dns, 'answers') and isinstance(dns.answers, list):
+            for answer in dns.answers:
+                try:
+                    if hasattr(answer, 'data'):
+                        answers.append(str(answer.data))
+                    elif hasattr(answer, 'cname'):
+                        answers.append(str(answer.cname))
+                    elif hasattr(answer, 'nsname'):
+                        answers.append(str(answer.nsname))
+                    elif hasattr(answer, 'mx_mail_exchange'):
+                        answers.append(str(answer.mx_mail_exchange))
+                    elif hasattr(answer, 'txt'):
+                        answers.append(str(answer.txt))
+                    
+                    if hasattr(answer, 'ttl'):
+                        ttls.append(int(answer.ttl))
+                except Exception as e:
+                    print(f"[DNS Answer Extraction] Error processing an answer object: {e}")
+
+        # Fallback for when `dns.answers` is not available or not a list
+        else:
+            # A/AAAA records
+            if hasattr(dns, 'a'):
+                answers.append(dns.a)
+                if hasattr(dns, 'a_ttl'): ttls.append(int(dns.a_ttl))
+            if hasattr(dns, 'aaaa'):
+                answers.append(dns.aaaa)
+                if hasattr(dns, 'aaaa_ttl'): ttls.append(int(dns.aaaa_ttl))
+            
+            # CNAME
+            if hasattr(dns, 'cname'):
+                answers.append(dns.cname)
+                if hasattr(dns, 'cname_ttl'): ttls.append(int(dns.cname_ttl))
+            
+            # MX
+            if hasattr(dns, 'mx_mail_exchange'):
+                answers.append(dns.mx_mail_exchange)
+                if hasattr(dns, 'mx_mail_exchange_ttl'): ttls.append(int(dns.mx_mail_exchange_ttl))
+            
+            # TXT
+            if hasattr(dns, 'txt'):
+                answers.append(dns.txt)
+                if hasattr(dns, 'txt_ttl'): ttls.append(int(dns.txt_ttl))
+
+        uid = f"C{hash(f'{src_ip}{src_port}{dst_ip}{dst_port}{trans_id}{timestamp}') % 100000000:08x}"
+        
+        record = {
+            'ts': timestamp, 'uid': uid, 'pcap_id': pcap_id,
+            'id_orig_h': src_ip, 'id_orig_p': src_port,
+            'id_resp_h': dst_ip, 'id_resp_p': dst_port,
+            'proto': proto, 'trans_id': trans_id, 'query': query,
+            'qclass': qclass, 'qclass_name': qclass_name,
+            'qtype': qtype, 'qtype_name': qtype_name,
+            'rcode': rcode, 'rcode_name': rcode_name,
+            'AA': AA, 'TC': TC, 'RD': RD, 'RA': RA, 'Z': Z,
+            'answers': answers, 'TTLs': ttls, 'rejected': False
+        }
+        print(f"[DNS EXTRACTION SUCCESS] Extracted record: {record}")
+        return record
+        
+    except Exception as e:
+        print(f"[DNS EXTRACTION FAILED] Packet: {packet.number}, Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 def extract_packet_info(packet: Any, pcap_id: uuid.UUID, packet_num_counter: int) -> Optional[Dict[str, Any]]:
     """Extracts relevant information from a pyshark packet for ClickHouse insertion."""
     try:
@@ -244,11 +381,13 @@ def parse_and_ingest_pcap_sync(file_path: Path, pcap_id: uuid.UUID, original_fil
     """Synchronously parses a PCAP file and ingests data into ClickHouse."""
     cap = None
     packets_to_insert_dicts = []
+    dns_records_to_insert = []
     packet_count = 0
     total_bytes = 0
     start_time = None
     end_time = None
     batch_size = 1000 # Insert in batches
+    dns_batch_size = 500
 
     print(f"[ClickHouse Ingestion] Attempting to open PCAP: {file_path}")
     try:
@@ -273,6 +412,12 @@ def parse_and_ingest_pcap_sync(file_path: Path, pcap_id: uuid.UUID, original_fil
             packet_data = extract_packet_info(packet, pcap_id, packet_num_counter) # Pass counter
             if packet_data:
                 packets_to_insert_dicts.append(packet_data)
+            
+            # Extract DNS log if packet is DNS
+            if packet_data and packet_data['protocol'] == 'DNS':
+                dns_record = extract_dns_record(packet, pcap_id, packet_data['ts'])
+                if dns_record:
+                    dns_records_to_insert.append(dns_record)
 
             if len(packets_to_insert_dicts) >= batch_size:
                 # Convert dicts to tuples in the correct order for ClickHouse insertion
@@ -293,7 +438,7 @@ def parse_and_ingest_pcap_sync(file_path: Path, pcap_id: uuid.UUID, original_fil
                         r["layers_json"],
                     ))
                 
-                print(f"[ClickHouse Ingestion] Inserting batch of {len(rows)} packets: {rows[0]} ... {rows[-1]}")
+                print(f"[ClickHouse Ingestion] Inserting batch of {len(rows)} packets")
                 get_ch_client().insert(
                     'packets',
                     rows,
@@ -302,8 +447,32 @@ def parse_and_ingest_pcap_sync(file_path: Path, pcap_id: uuid.UUID, original_fil
                         "dst_port", "protocol", "length", "file_offset", "info", "layers_json"
                     ]
                 )
-                print(f"[ClickHouse Ingestion] Inserted {len(rows)} packets. Total: {packet_count}")
                 packets_to_insert_dicts = []
+                
+            # Insert DNS records batch
+            if len(dns_records_to_insert) >= dns_batch_size:
+                dns_rows = []
+                for d in dns_records_to_insert:
+                    dns_rows.append((
+                        d['ts'], d['uid'], d['pcap_id'], d['id_orig_h'], d['id_orig_p'],
+                        d['id_resp_h'], d['id_resp_p'], d['proto'], d['trans_id'],
+                        d['query'], d['qclass'], d['qclass_name'], d['qtype'], d['qtype_name'],
+                        d['rcode'], d['rcode_name'], d['AA'], d['TC'], d['RD'], d['RA'],
+                        d['Z'], d['answers'], d['TTLs'], d['rejected']
+                    ))
+                get_ch_client().insert(
+                    'dns_log',
+                    dns_rows,
+                    column_names=[
+                        'ts', 'uid', 'pcap_id', 'id_orig_h', 'id_orig_p',
+                        'id_resp_h', 'id_resp_p', 'proto', 'trans_id',
+                        'query', 'qclass', 'qclass_name', 'qtype', 'qtype_name',
+                        'rcode', 'rcode_name', 'AA', 'TC', 'RD', 'RA',
+                        'Z', 'answers', 'TTLs', 'rejected'
+                    ]
+                )
+                print(f"[ClickHouse Ingestion] Inserted {len(dns_rows)} DNS records")
+                dns_records_to_insert = []
             
             # Update progress
             progress = (packet_num_counter / total_packets) * 100
@@ -327,7 +496,7 @@ def parse_and_ingest_pcap_sync(file_path: Path, pcap_id: uuid.UUID, original_fil
                     r["info"],
                     r["layers_json"],
                 ))
-            print(f"[ClickHouse Ingestion] Inserting final batch of {len(rows)} packets: {rows[0]} ... {rows[-1]}")
+            print(f"[ClickHouse Ingestion] Inserting final batch of {len(rows)} packets")
             get_ch_client().insert(
                 'packets',
                 rows,
@@ -336,7 +505,30 @@ def parse_and_ingest_pcap_sync(file_path: Path, pcap_id: uuid.UUID, original_fil
                     "dst_port", "protocol", "length", "file_offset", "info", "layers_json"
                 ]
             )
-            print(f"[ClickHouse Ingestion] Inserted final {len(rows)} packets. Total: {packet_count}")
+        
+        # Insert remaining DNS records
+        if dns_records_to_insert:
+            dns_rows = []
+            for d in dns_records_to_insert:
+                dns_rows.append((
+                    d['ts'], d['uid'], d['pcap_id'], d['id_orig_h'], d['id_orig_p'],
+                    d['id_resp_h'], d['id_resp_p'], d['proto'], d['trans_id'],
+                    d['query'], d['qclass'], d['qclass_name'], d['qtype'], d['qtype_name'],
+                    d['rcode'], d['rcode_name'], d['AA'], d['TC'], d['RD'], d['RA'],
+                    d['Z'], d['answers'], d['TTLs'], d['rejected']
+                ))
+            get_ch_client().insert(
+                'dns_log',
+                dns_rows,
+                column_names=[
+                    'ts', 'uid', 'pcap_id', 'id_orig_h', 'id_orig_p',
+                    'id_resp_h', 'id_resp_p', 'proto', 'trans_id',
+                    'query', 'qclass', 'qclass_name', 'qtype', 'qtype_name',
+                    'rcode', 'rcode_name', 'AA', 'TC', 'RD', 'RA',
+                    'Z', 'answers', 'TTLs', 'rejected'
+                ]
+            )
+            print(f"[ClickHouse Ingestion] Inserted final {len(dns_rows)} DNS records")
 
         capture_duration = (end_time - start_time).total_seconds() if start_time and end_time else 0.0
 

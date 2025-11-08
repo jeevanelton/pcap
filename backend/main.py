@@ -785,12 +785,12 @@ async def get_geomap_data(file_id: str, current_user: dict = Depends(get_current
 async def get_dns_details(file_id: str, current_user: dict = Depends(get_current_user)):
     """Get detailed DNS query information."""
     try:
-        # Extract DNS queries from layers_json
+        # Query from the dns_log table (Zeek-compatible format)
         query = f"""
         SELECT 
-            ts, src_ip, dst_ip, info, layers_json
-        FROM packets 
-        WHERE pcap_id = '{file_id}' AND protocol = 'DNS'
+            ts, id_orig_h, id_resp_h, query, qtype_name, rcode_name, answers
+        FROM dns_log 
+        WHERE pcap_id = '{file_id}'
         ORDER BY ts DESC
         LIMIT 500
         """
@@ -801,40 +801,21 @@ async def get_dns_details(file_id: str, current_user: dict = Depends(get_current
         top_domains = {}
         
         for row in result.result_rows:
-            ts, src_ip, dst_ip, info, layers_json_str = row
+            ts, src_ip, dst_ip, query_name, qtype_name, rcode_name, answers = row
             
-            # Parse layers_json to extract DNS details
-            try:
-                layers = json.loads(layers_json_str) if layers_json_str else []
-                dns_layer = next((l for l in layers if l.get('name', '').lower() == 'dns'), None)
-                
-                if dns_layer:
-                    fields = dns_layer.get('fields', {})
-                    query_name = fields.get('dns.qry.name', 'Unknown')
-                    query_type = fields.get('dns.qry.type', 'Unknown')
-                    
-                    dns_queries.append({
-                        "time": ts.isoformat(),
-                        "source": str(src_ip),
-                        "destination": str(dst_ip),
-                        "query": query_name,
-                        "type": query_type,
-                        "info": info
-                    })
-                    
-                    # Aggregate stats
-                    query_types[query_type] = query_types.get(query_type, 0) + 1
-                    top_domains[query_name] = top_domains.get(query_name, 0) + 1
-            except:
-                # Fallback to info string
-                dns_queries.append({
-                    "time": ts.isoformat(),
-                    "source": str(src_ip),
-                    "destination": str(dst_ip),
-                    "query": "Unknown",
-                    "type": "Unknown",
-                    "info": info
-                })
+            dns_queries.append({
+                "time": ts.isoformat(),
+                "source": str(src_ip),
+                "destination": str(dst_ip),
+                "query": query_name,
+                "type": qtype_name,
+                "rcode": rcode_name,
+                "answers": answers if answers else []
+            })
+            
+            # Aggregate stats
+            query_types[qtype_name] = query_types.get(qtype_name, 0) + 1
+            top_domains[query_name] = top_domains.get(query_name, 0) + 1
         
         # Get top 20 domains
         top_domains_list = sorted(top_domains.items(), key=lambda x: x[1], reverse=True)[:20]

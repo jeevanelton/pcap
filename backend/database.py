@@ -108,6 +108,36 @@ def init_schema():
             ) ENGINE = MergeTree
             ORDER BY (upload_time)
         """),
+        # Zeek-style dns.log table
+        ("dns_log", """
+            CREATE TABLE IF NOT EXISTS dns_log (
+                ts DateTime,
+                uid String,
+                pcap_id UUID,
+                id_orig_h String,
+                id_orig_p UInt16,
+                id_resp_h String,
+                id_resp_p UInt16,
+                proto String,
+                trans_id UInt16,
+                query String,
+                qclass UInt16,
+                qclass_name String,
+                qtype UInt16,
+                qtype_name String,
+                rcode UInt16,
+                rcode_name String,
+                AA Bool,
+                TC Bool,
+                RD Bool,
+                RA Bool,
+                Z UInt8,
+                answers Array(String),
+                TTLs Array(UInt32),
+                rejected Bool
+            ) ENGINE = MergeTree
+            ORDER BY (pcap_id, ts)
+        """),
     ]
 
     for name, ddl in statements:

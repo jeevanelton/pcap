@@ -160,81 +160,159 @@ const FeatureDetailModal: React.FC<FeatureDetailModalProps> = ({ featureKey, fea
 
 // DNS View Component
 const DNSView: React.FC<{ data: any; searchTerm: string }> = ({ data, searchTerm }) => {
-  const filteredQueries = data.queries?.filter((q: any) =>
-    q.query.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    q.source.toLowerCase().includes(searchTerm.toLowerCase())
-  ) || [];
+  console.log('[DNS Modal] Received data:', data);
+  
+  const queries = data?.queries || [];
+  const queryTypes = data?.query_types || {};
+  const rcodes = data?.rcodes || {};
+  const topDomains = data?.top_domains || [];
+  
+  const filteredQueries = queries.filter((q: any) => {
+    if (!searchTerm) return true;
+    const search = searchTerm.toLowerCase();
+    const query = q?.query || '';
+    const source = q?.source || '';
+    const dest = q?.destination || '';
+    const qtype = q?.qtype_name || '';
+    return query.toLowerCase().includes(search) ||
+      source.toLowerCase().includes(search) ||
+      dest.toLowerCase().includes(search) ||
+      qtype.toLowerCase().includes(search);
+  });
 
   return (
     <div className="space-y-6">
       {/* Stats Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
         <div className="bg-blue-50 p-4 rounded-lg border border-blue-200">
           <h3 className="text-sm font-medium text-blue-900">Total Queries</h3>
-          <p className="text-2xl font-bold text-blue-600">{data.total}</p>
+          <p className="text-2xl font-bold text-blue-600">{data?.total || 0}</p>
         </div>
         <div className="bg-green-50 p-4 rounded-lg border border-green-200">
           <h3 className="text-sm font-medium text-green-900">Query Types</h3>
-          <p className="text-2xl font-bold text-green-600">{Object.keys(data.query_types || {}).length}</p>
+          <p className="text-2xl font-bold text-green-600">{Object.keys(queryTypes).length}</p>
         </div>
         <div className="bg-purple-50 p-4 rounded-lg border border-purple-200">
           <h3 className="text-sm font-medium text-purple-900">Unique Domains</h3>
-          <p className="text-2xl font-bold text-purple-600">{data.top_domains?.length || 0}</p>
+          <p className="text-2xl font-bold text-purple-600">{data?.unique_domains || 0}</p>
+        </div>
+        <div className="bg-yellow-50 p-4 rounded-lg border border-yellow-200">
+          <h3 className="text-sm font-medium text-yellow-900">Response Codes</h3>
+          <p className="text-2xl font-bold text-yellow-600">{Object.keys(rcodes).length}</p>
         </div>
       </div>
 
       {/* Query Types Distribution */}
-      <div className="bg-gray-50 p-4 rounded-lg">
-        <h3 className="font-semibold text-gray-900 mb-3">Query Types</h3>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-          {Object.entries(data.query_types || {}).map(([type, count]: [string, any]) => (
-            <div key={type} className="bg-white p-3 rounded border border-gray-200">
-              <span className="text-xs text-gray-600">{type}</span>
-              <p className="text-lg font-semibold text-gray-900">{count}</p>
-            </div>
-          ))}
+      {Object.keys(queryTypes).length > 0 && (
+        <div className="bg-gray-50 p-4 rounded-lg">
+          <h3 className="font-semibold text-gray-900 mb-3">Query Types Distribution</h3>
+          <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-2">
+            {Object.entries(queryTypes).map(([type, count]: [string, any]) => (
+              <div key={type} className="bg-white p-3 rounded border border-gray-200">
+                <span className="text-xs text-gray-600 font-medium">{type}</span>
+                <p className="text-lg font-bold text-blue-600">{count}</p>
+              </div>
+            ))}
+          </div>
         </div>
-      </div>
+      )}
+
+      {/* Response Codes */}
+      {Object.keys(rcodes).length > 0 && (
+        <div className="bg-gray-50 p-4 rounded-lg">
+          <h3 className="font-semibold text-gray-900 mb-3">Response Codes</h3>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+            {Object.entries(rcodes).map(([rcode, count]: [string, any]) => (
+              <div key={rcode} className="bg-white p-3 rounded border border-gray-200">
+                <span className={`text-xs font-semibold ${rcode === 'NOERROR' ? 'text-green-600' : 'text-red-600'}`}>
+                  {rcode}
+                </span>
+                <p className="text-lg font-bold text-gray-900">{count}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Top Domains */}
-      <div className="bg-gray-50 p-4 rounded-lg">
-        <h3 className="font-semibold text-gray-900 mb-3">Top Domains</h3>
-        <div className="space-y-2">
-          {data.top_domains?.slice(0, 10).map((item: any, idx: number) => (
-            <div key={idx} className="flex items-center justify-between bg-white p-3 rounded border border-gray-200">
-              <span className="text-sm text-gray-900 font-mono truncate flex-1">{item.domain}</span>
-              <span className="text-sm font-semibold text-indigo-600 ml-4">{item.count}</span>
-            </div>
-          ))}
+      {topDomains.length > 0 && (
+        <div className="bg-gray-50 p-4 rounded-lg">
+          <h3 className="font-semibold text-gray-900 mb-3">Top Queried Domains</h3>
+          <div className="space-y-2 max-h-64 overflow-y-auto">
+            {topDomains.slice(0, 20).map((item: any, idx: number) => (
+              <div key={idx} className="flex items-center justify-between bg-white p-2 rounded border border-gray-200 hover:bg-gray-50">
+                <span className="text-sm text-gray-900 font-mono truncate flex-1">{item.domain || 'Unknown'}</span>
+                <span className="text-sm font-semibold text-indigo-600 ml-4 bg-indigo-50 px-2 py-1 rounded">{item.count}</span>
+              </div>
+            ))}
+          </div>
         </div>
-      </div>
+      )}
 
-      {/* Queries Table */}
+      {/* DNS Queries Table */}
       <div>
-        <h3 className="font-semibold text-gray-900 mb-3">Recent Queries</h3>
-        <div className="overflow-x-auto">
+        <h3 className="font-semibold text-gray-900 mb-3">
+          DNS Queries ({filteredQueries.length}{filteredQueries.length !== queries.length && ` of ${queries.length}`})
+        </h3>
+        <div className="overflow-x-auto bg-white border border-gray-200 rounded-lg">
           <table className="w-full text-sm">
-            <thead className="bg-gray-100 border-b border-gray-200">
+            <thead className="bg-indigo-600 text-white">
               <tr>
-                <th className="text-left p-3 font-semibold text-gray-700">Time</th>
-                <th className="text-left p-3 font-semibold text-gray-700">Query</th>
-                <th className="text-left p-3 font-semibold text-gray-700">Type</th>
-                <th className="text-left p-3 font-semibold text-gray-700">Source</th>
-                <th className="text-left p-3 font-semibold text-gray-700">Destination</th>
+                <th className="text-left p-3 font-semibold">Time</th>
+                <th className="text-left p-3 font-semibold">Query Domain</th>
+                <th className="text-left p-3 font-semibold">Type</th>
+                <th className="text-left p-3 font-semibold">Class</th>
+                <th className="text-left p-3 font-semibold">Response</th>
+                <th className="text-left p-3 font-semibold">Answers</th>
+                <th className="text-left p-3 font-semibold">Source</th>
+                <th className="text-left p-3 font-semibold">Destination</th>
+                <th className="text-left p-3 font-semibold">Flags</th>
               </tr>
             </thead>
-            <tbody>
-              {filteredQueries.map((query: any, idx: number) => (
-                <tr key={idx} className="border-b border-gray-100 hover:bg-gray-50">
-                  <td className="p-3 text-gray-600">{new Date(query.time).toLocaleTimeString()}</td>
-                  <td className="p-3 text-gray-900 font-mono text-xs">{query.query}</td>
-                  <td className="p-3">
-                    <span className="px-2 py-1 bg-blue-100 text-blue-700 rounded text-xs">{query.type}</span>
+            <tbody className="divide-y divide-gray-200">
+              {filteredQueries.length === 0 ? (
+                <tr>
+                  <td colSpan={9} className="p-8 text-center text-gray-500">
+                    {queries.length === 0 ? 'No DNS queries found' : 'No queries match your search'}
                   </td>
-                  <td className="p-3 text-gray-600 font-mono text-xs">{query.source}</td>
-                  <td className="p-3 text-gray-600 font-mono text-xs">{query.destination}</td>
                 </tr>
-              ))}
+              ) : (
+                filteredQueries.map((query: any, idx: number) => (
+                  <tr key={idx} className="hover:bg-indigo-50 transition-colors">
+                    <td className="p-3 text-gray-600 whitespace-nowrap">
+                      {query.time ? new Date(query.time).toLocaleTimeString() : 'N/A'}
+                    </td>
+                    <td className="p-3 text-gray-900 font-mono text-xs max-w-xs truncate font-medium" title={query.query || 'Unknown'}>
+                      {query.query || <span className="text-red-500 font-bold">Unknown</span>}
+                    </td>
+                    <td className="p-3">
+                      <span className="px-2 py-1 bg-blue-600 text-white rounded font-semibold text-xs whitespace-nowrap">
+                        {query.qtype_name || 'Unknown'}
+                      </span>
+                    </td>
+                    <td className="p-3 text-gray-600 text-xs whitespace-nowrap">
+                      {query.qclass_name || 'Unknown'}
+                    </td>
+                    <td className="p-3">
+                      <span className={`px-2 py-1 rounded font-semibold text-xs whitespace-nowrap ${
+                        query.rcode_name === 'NOERROR' 
+                          ? 'bg-green-600 text-white' 
+                          : 'bg-red-600 text-white'
+                      }`}>
+                        {query.rcode_name || 'Unknown'}
+                      </span>
+                    </td>
+                    <td className="p-3 text-gray-700 font-mono text-xs max-w-xs truncate" title={query.answers?.join(', ')}>
+                      {query.answers && query.answers.length > 0 ? query.answers.join(', ') : '—'}
+                    </td>
+                    <td className="p-3 text-gray-600 font-mono text-xs whitespace-nowrap">{query.source || 'N/A'}</td>
+                    <td className="p-3 text-gray-600 font-mono text-xs whitespace-nowrap">{query.destination || 'N/A'}</td>
+                    <td className="p-3 text-gray-500 text-xs whitespace-nowrap">
+                      {[query.AA && 'AA', query.TC && 'TC', query.RD && 'RD', query.RA && 'RA'].filter(Boolean).join(' ') || '—'}
+                    </td>
+                  </tr>
+                ))
+              )}
             </tbody>
           </table>
         </div>
