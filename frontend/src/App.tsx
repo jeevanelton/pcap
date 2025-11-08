@@ -7,6 +7,7 @@ import NetworkGraph from '@/components/NetworkGraph';
 import FlowGraphEnhanced from '@/components/FlowGraphEnhanced';
 import GeoMap from '@/components/GeoMap';
 import FeatureDetailModal from '@/components/FeatureDetailModal';
+import DnsView from '@/components/DnsView';
 import { UploadCard } from '@/components/UploadCard';
 import './components/OverviewTab.css';
 import { ShieldCheck, Upload, BarChart2, Table, GitMerge, ArrowLeft, Activity, MapIcon } from 'lucide-react';
@@ -97,6 +98,7 @@ function App() {
   const [isUploadModalOpen, setUploadModalOpen] = useState(false);
   const [isLoadingProject, setIsLoadingProject] = useState(false);
   const [selectedFeature, setSelectedFeature] = useState<{key: string; title: string} | null>(null);
+  const [showDnsView, setShowDnsView] = useState(false); // legacy overlay toggle; prefer DNS tab
 
   useEffect(() => {
     if (projectId) {
@@ -206,7 +208,7 @@ function App() {
   const TabNav = () => (
     <div className="bg-white/80 backdrop-blur-md border-b border-gray-200 sticky top-0 z-40 shadow-sm">
       <nav className="-mb-px flex space-x-8 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8" aria-label="Tabs">
-        {['Dashboard', 'Packets', 'Network Graph', 'Flow Graph', 'GeoMap'].map(tab => (
+        {['Dashboard', 'DNS', 'Packets', 'Network Graph', 'Flow Graph', 'GeoMap'].map(tab => (
           <button
             key={tab}
             onClick={() => setActiveTab(tab)}
@@ -219,6 +221,7 @@ function App() {
             {
               {
                 'Dashboard': <BarChart2 className="mr-2 h-5 w-5" />,
+                'DNS': <Table className="mr-2 h-5 w-5" />,
                 'Packets': <Table className="mr-2 h-5 w-5" />,
                 'Network Graph': <GitMerge className="mr-2 h-5 w-5" />,
                 'Flow Graph': <Activity className="mr-2 h-5 w-5" />,
@@ -329,7 +332,16 @@ function App() {
                         <div 
                           key={c.key} 
                           className={`card-tile border border-gray-200 rounded-md p-4 bg-gray-50 flex flex-col ${!has? 'opacity-40':''} ${hasData && isImplemented ? 'cursor-pointer hover:shadow-lg hover:border-indigo-300 transition-all' : ''}`}
-                          onClick={() => hasData && isImplemented && setSelectedFeature({key: c.key, title: c.title})}
+                          onClick={() => {
+                            if (hasData && isImplemented) {
+                              if (c.key === 'dns') {
+                                // Prefer dedicated DNS tab
+                                setActiveTab('DNS');
+                              } else {
+                                setSelectedFeature({key: c.key, title: c.title});
+                              }
+                            }
+                          }}
                         > 
                           <div className="flex items-center justify-between mb-2">
                             <span className="font-semibold text-sm text-gray-900">{c.title}</span>
@@ -349,6 +361,20 @@ function App() {
                 </div>
               </>
             )}
+          </div>
+        );
+      case 'DNS':
+        return (
+          <div className="bg-white rounded-2xl shadow-lg border border-gray-100 overflow-hidden">
+            <div className="p-4 border-b border-gray-200 bg-gradient-to-r from-indigo-50 to-purple-50">
+              <div>
+                <h3 className="text-xl font-bold text-gray-900">DNS Analytics</h3>
+                <p className="text-sm text-gray-600 mt-1">Server-driven filters, charts, and lazy loading</p>
+              </div>
+            </div>
+            <div className="p-4">
+              {fileId && <DnsView fileId={fileId} />}
+            </div>
           </div>
         );
       case 'Packets':

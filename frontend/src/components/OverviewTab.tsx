@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import './OverviewTab.css';
 import { API_BASE_URL } from '../config';
 import FeatureDetailModal from './FeatureDetailModal';
+import DnsView from './DnsView';
 
 const API_BASE = API_BASE_URL;
 
@@ -50,6 +51,7 @@ const OverviewTab: React.FC<{ fileId: string }>= ({ fileId }) => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedFeature, setSelectedFeature] = useState<CardSpec | null>(null);
+  const [showDnsView, setShowDnsView] = useState(false);
 
   useEffect(() => {
     if (!fileId) return;
@@ -65,7 +67,10 @@ const OverviewTab: React.FC<{ fileId: string }>= ({ fileId }) => {
 
   const handleCardClick = (card: CardSpec) => {
     const has = (card.dependsOn||[]).every(proto => data?.protocols[proto] !== undefined);
-    if (has) {
+    if (!has) return;
+    if (card.key === 'dns') {
+      setShowDnsView(true);
+    } else {
       setSelectedFeature(card);
     }
   };
@@ -103,7 +108,18 @@ const OverviewTab: React.FC<{ fileId: string }>= ({ fileId }) => {
         })}
       </section>
     </>}
-    {selectedFeature && (
+    {showDnsView && (
+      <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm p-6 overflow-y-auto">
+        <div className="bg-white rounded-2xl shadow-2xl max-w-7xl mx-auto p-6 space-y-6">
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="text-2xl font-bold text-gray-900">DNS Analytics</h2>
+            <button onClick={() => setShowDnsView(false)} className="px-3 py-1.5 text-sm rounded-lg bg-gray-200 hover:bg-gray-300 text-gray-800">Close</button>
+          </div>
+          <DnsView fileId={fileId} />
+        </div>
+      </div>
+    )}
+    {selectedFeature && !showDnsView && (
       <FeatureDetailModal
         featureKey={selectedFeature.key}
         featureTitle={selectedFeature.title}

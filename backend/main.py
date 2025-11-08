@@ -151,9 +151,27 @@ async def create_project(payload: ProjectCreateRequest, current_user: dict = Dep
 
 @app.delete("/api/projects/{project_id}")
 async def delete_project(project_id: str, current_user: dict = Depends(get_current_user)):
-    get_ch_client().command(f"ALTER TABLE pcap_project_map DELETE WHERE user_id = '{current_user['id']}' AND project_id = '{project_id}'")
-    get_ch_client().command(f"ALTER TABLE projects DELETE WHERE user_id = '{current_user['id']}' AND id = '{project_id}'")
-    return {"ok": True}
+    # Delete all PCAP data associated with this project (packets, dns_log, metadata, files), then mappings and project
+    client = get_ch_client()
+    # Find all pcaps mapped to this project for this user
+    pcaps = client.query(
+        f"SELECT pcap_id FROM pcap_project_map WHERE user_id = '{current_user['id']}' AND project_id = '{project_id}'"
+    ).result_rows
+    for (pcap_id,) in pcaps:
+        try:
+            client.command(f"ALTER TABLE packets DELETE WHERE pcap_id = '{pcap_id}'")
+            client.command(f"ALTER TABLE dns_log DELETE WHERE pcap_id = '{pcap_id}'")
+            client.command(f"ALTER TABLE pcap_metadata DELETE WHERE id = '{pcap_id}'")
+            # Remove file from disk
+            file_path = UPLOAD_DIR / f"{pcap_id}.pcap"
+            if file_path.exists():
+                file_path.unlink()
+        except Exception as e:
+            print(f"[Project Delete] Error cleaning pcap {pcap_id}: {e}")
+    # Remove mappings and the project record
+    client.command(f"ALTER TABLE pcap_project_map DELETE WHERE user_id = '{current_user['id']}' AND project_id = '{project_id}'")
+    client.command(f"ALTER TABLE projects DELETE WHERE user_id = '{current_user['id']}' AND id = '{project_id}'")
+    return {"ok": True, "deleted_pcaps": len(pcaps)}
 
 @app.get("/api/projects/{project_id}/files")
 async def list_project_files(project_id: str, current_user: dict = Depends(get_current_user)):
@@ -194,6 +212,7 @@ async def upload_pcap_to_project(project_id: str, background_tasks: BackgroundTa
         for (old_pcap_id,) in existing_files:
             try:
                 get_ch_client().command(f"ALTER TABLE packets DELETE WHERE pcap_id = '{old_pcap_id}'")
+                get_ch_client().command(f"ALTER TABLE dns_log DELETE WHERE pcap_id = '{old_pcap_id}'")
                 get_ch_client().command(f"ALTER TABLE pcap_metadata DELETE WHERE id = '{old_pcap_id}'")
                 get_ch_client().command(f"ALTER TABLE pcap_project_map DELETE WHERE pcap_id = '{old_pcap_id}'")
                 old_file = UPLOAD_DIR / f"{old_pcap_id}.pcap"
@@ -305,8 +324,9 @@ async def list_pcap_files(current_user: dict = Depends(get_current_user)):
 async def delete_pcap_file(file_id: str, current_user: dict = Depends(get_current_user)):
     """Delete a specific PCAP file's data from ClickHouse and the file itself."""
     try:
-        # Delete from packets table
+        # Delete from packets and dns tables
         get_ch_client().command(f"ALTER TABLE packets DELETE WHERE pcap_id = '{file_id}'")
+        get_ch_client().command(f"ALTER TABLE dns_log DELETE WHERE pcap_id = '{file_id}'")
         # Delete from metadata table
         get_ch_client().command(f"ALTER TABLE pcap_metadata DELETE WHERE id = '{file_id}'")
         
@@ -314,6 +334,9 @@ async def delete_pcap_file(file_id: str, current_user: dict = Depends(get_curren
         file_path = UPLOAD_DIR / f"{file_id}.pcap"
         if file_path.is_file():
             file_path.unlink()
+
+        # Remove mapping entries
+        get_ch_client().command(f"ALTER TABLE pcap_project_map DELETE WHERE pcap_id = '{file_id}' AND user_id = '{current_user['id']}'")
 
         return {"message": f"Data for file {file_id} deleted successfully."}
     except Exception as e:
@@ -785,49 +808,208 @@ async def get_geomap_data(file_id: str, current_user: dict = Depends(get_current
 async def get_dns_details(file_id: str, current_user: dict = Depends(get_current_user)):
     """Get detailed DNS query information."""
     try:
-        # Query from the dns_log table (Zeek-compatible format)
-        query = f"""
+        # Backward-compatible basic DNS details (will be superseded by /api/dns/... endpoints)
+        base_query = f"""
         SELECT 
-            ts, id_orig_h, id_resp_h, query, qtype_name, rcode_name, answers
+            ts, id_orig_h, id_resp_h, query, qtype_name, rcode_name, answers, AA, TC, RD, RA, TTLs
         FROM dns_log 
         WHERE pcap_id = '{file_id}'
         ORDER BY ts DESC
-        LIMIT 500
+        LIMIT 300
         """
-        result = ch_client.query(query)
-        
+        result = ch_client.query(base_query)
+
         dns_queries = []
-        query_types = {}
-        top_domains = {}
-        
+        query_types: Dict[str, int] = {}
+        rcodes: Dict[str, int] = {}
+        domain_counts: Dict[str, int] = {}
+
         for row in result.result_rows:
-            ts, src_ip, dst_ip, query_name, qtype_name, rcode_name, answers = row
-            
+            ts, src_ip, dst_ip, query_name, qtype_name, rcode_name, answers, AA, TC, RD, RA, TTLs = row
+            answers = answers or []
+            TTLs = TTLs or []
             dns_queries.append({
                 "time": ts.isoformat(),
                 "source": str(src_ip),
                 "destination": str(dst_ip),
                 "query": query_name,
-                "type": qtype_name,
-                "rcode": rcode_name,
-                "answers": answers if answers else []
+                "qtype_name": qtype_name,
+                "rcode_name": rcode_name,
+                "answers": answers,
+                "flags": {"AA": AA, "TC": TC, "RD": RD, "RA": RA},
+                "ttls": TTLs,
             })
-            
-            # Aggregate stats
-            query_types[qtype_name] = query_types.get(qtype_name, 0) + 1
-            top_domains[query_name] = top_domains.get(query_name, 0) + 1
-        
-        # Get top 20 domains
-        top_domains_list = sorted(top_domains.items(), key=lambda x: x[1], reverse=True)[:20]
-        
+            if qtype_name:
+                query_types[qtype_name] = query_types.get(qtype_name, 0) + 1
+            if rcode_name:
+                rcodes[rcode_name] = rcodes.get(rcode_name, 0) + 1
+            if query_name:
+                domain_counts[query_name] = domain_counts.get(query_name, 0) + 1
+
+        top_domains_list = sorted(domain_counts.items(), key=lambda x: x[1], reverse=True)[:20]
+
         return {
             "total": len(dns_queries),
-            "queries": dns_queries[:100],  # Return first 100 for display
+            "queries": dns_queries,  # Frontend will paginate soon
             "query_types": query_types,
-            "top_domains": [{"domain": d[0], "count": d[1]} for d in top_domains_list]
+            "rcodes": rcodes,
+            "unique_domains": len(domain_counts),
+            "top_domains": [{"domain": d, "count": c} for d, c in top_domains_list]
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get DNS details: {e}")
+
+@app.get("/api/dns/{file_id}/records")
+async def dns_records(
+    file_id: str,
+    limit: int = 100,
+    offset: int = 0,
+    search: str = "",
+    qtype: str = "",
+    rcode: str = "",
+    sort: str = "time_desc",
+    current_user: dict = Depends(get_current_user)
+):
+    """Paginated DNS query records with server-side filtering.
+    Filters:
+      - search: substring match on query domain (case-insensitive)
+      - qtype: comma-separated list of qtype_name
+      - rcode: comma-separated list of rcode_name
+    Sorting:
+      - time_desc (default), time_asc, domain_asc, domain_desc
+    """
+    try:
+        limit = max(1, min(limit, 500))
+        # Build WHERE clauses
+        where_clauses = [f"pcap_id = '{file_id}'"]
+        if search:
+            where_clauses.append(f"lower(query) LIKE '%{search.lower()}%'")
+        if qtype:
+            qtypes = [qt.strip() for qt in qtype.split(',') if qt.strip()]
+            if qtypes:
+                in_list = ",".join([f"'{qt}'" for qt in qtypes])
+                where_clauses.append(f"qtype_name IN ({in_list})")
+        if rcode:
+            rcodes_list = [rc.strip() for rc in rcode.split(',') if rc.strip()]
+            if rcodes_list:
+                in_list = ",".join([f"'{rc}'" for rc in rcodes_list])
+                where_clauses.append(f"rcode_name IN ({in_list})")
+
+        where_sql = " AND ".join(where_clauses)
+
+        sort_map = {
+            "time_desc": "ts DESC",
+            "time_asc": "ts ASC",
+            "domain_asc": "query ASC",
+            "domain_desc": "query DESC"
+        }
+        order_clause = sort_map.get(sort, "ts DESC")
+
+        base_sql = f"""
+        SELECT ts, id_orig_h, id_resp_h, query, qtype_name, rcode_name, answers, AA, TC, RD, RA, TTLs
+        FROM dns_log
+        WHERE {where_sql}
+        ORDER BY {order_clause}
+        LIMIT {limit} OFFSET {offset}
+        """
+        rows = ch_client.query(base_sql).result_rows
+
+        # Total count for pagination
+        count_sql = f"SELECT COUNT() FROM dns_log WHERE {where_sql}"
+        total_count = ch_client.query(count_sql).result_rows[0][0]
+
+        records = []
+        for r in rows:
+            ts, src_ip, dst_ip, domain, qtype_name, rcode_name, answers, AA, TC, RD, RA, TTLs = r
+            records.append({
+                "time": ts.isoformat(),
+                "source": src_ip,
+                "destination": dst_ip,
+                "query": domain,
+                "qtype_name": qtype_name,
+                "rcode_name": rcode_name,
+                "answers": answers or [],
+                "flags": {"AA": AA, "TC": TC, "RD": RD, "RA": RA},
+                "ttls": TTLs or []
+            })
+
+        return {
+            "total": total_count,
+            "returned": len(records),
+            "offset": offset,
+            "limit": limit,
+            "has_more": (offset + len(records)) < total_count,
+            "records": records
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch DNS records: {e}")
+
+@app.get("/api/dns/{file_id}/aggregates")
+async def dns_aggregates(
+    file_id: str,
+    search: str = "",
+    qtype: str = "",
+    rcode: str = "",
+    top_limit: int = 20,
+    current_user: dict = Depends(get_current_user)
+):
+    """Aggregated DNS statistics supporting filters matching /records."""
+    try:
+        # Reuse filter building logic
+        where_clauses = [f"pcap_id = '{file_id}'"]
+        if search:
+            where_clauses.append(f"lower(query) LIKE '%{search.lower()}%'")
+        if qtype:
+            qtypes = [qt.strip() for qt in qtype.split(',') if qt.strip()]
+            if qtypes:
+                in_list = ",".join([f"'{qt}'" for qt in qtypes])
+                where_clauses.append(f"qtype_name IN ({in_list})")
+        if rcode:
+            rcodes_list = [rc.strip() for rc in rcode.split(',') if rc.strip()]
+            if rcodes_list:
+                in_list = ",".join([f"'{rc}'" for rc in rcodes_list])
+                where_clauses.append(f"rcode_name IN ({in_list})")
+        where_sql = " AND ".join(where_clauses)
+
+        total_sql = f"SELECT COUNT() FROM dns_log WHERE {where_sql}"
+        total = ch_client.query(total_sql).result_rows[0][0]
+
+        unique_domains_sql = f"SELECT uniq(query) FROM dns_log WHERE {where_sql}"
+        unique_domains = ch_client.query(unique_domains_sql).result_rows[0][0]
+
+        qtypes_sql = f"SELECT qtype_name, COUNT() FROM dns_log WHERE {where_sql} GROUP BY qtype_name"
+        qtype_rows = ch_client.query(qtypes_sql).result_rows
+        qtype_map = {r[0]: r[1] for r in qtype_rows if r[0]}
+
+        rcodes_sql = f"SELECT rcode_name, COUNT() FROM dns_log WHERE {where_sql} GROUP BY rcode_name"
+        rcode_rows = ch_client.query(rcodes_sql).result_rows
+        rcode_map = {r[0]: r[1] for r in rcode_rows if r[0]}
+
+        top_domains_sql = f"""
+        SELECT query, COUNT() AS c
+        FROM dns_log
+        WHERE {where_sql}
+        GROUP BY query
+        ORDER BY c DESC
+        LIMIT {top_limit}
+        """
+        top_rows = ch_client.query(top_domains_sql).result_rows
+        top_domains = [{"domain": r[0], "count": r[1]} for r in top_rows if r[0]]
+
+        return {
+            "total": total,
+            "unique_domains": unique_domains,
+            "query_types": qtype_map,
+            "rcodes": rcode_map,
+            "top_domains": top_domains,
+            "filters_applied": {
+                "search": search or None,
+                "qtype": qtype.split(',') if qtype else [],
+                "rcode": rcode.split(',') if rcode else [],
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to compute DNS aggregates: {e}")
 
 
 @app.get("/api/details/http/{file_id}")

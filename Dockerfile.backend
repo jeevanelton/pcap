@@ -5,6 +5,7 @@ RUN apt-get update && apt-get install -y \
     tshark \
     libpcap-dev \
     wget \
+    inotify-tools \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
