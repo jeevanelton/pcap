@@ -1,9 +1,11 @@
-import pyshark
+import dpkt
+import socket
+import json
 from datetime import datetime
 import uuid
-from typing import Dict, Any, Optional
-import json
+from typing import Dict, Any, Optional, List
 from pathlib import Path
+import sys
 
 from database import get_ch_client
 
@@ -25,101 +27,83 @@ DNS_QCLASS_MAP = {
     1: "C_INTERNET", 3: "C_CHAOS", 4: "C_HESIOD", 254: "C_NONE", 255: "C_ANY"
 }
 
-def extract_dns_record(packet: Any, pcap_id: uuid.UUID, timestamp: datetime) -> Optional[Dict[str, Any]]:
-    """Extract Zeek-style DNS log fields from a DNS packet."""
+# Common IP Protocol Numbers
+IP_PROTOCOLS = {
+    1: 'ICMP', 2: 'IGMP', 4: 'IP-in-IP', 6: 'TCP', 17: 'UDP', 27: 'RDP', 41: 'IPv6', 47: 'GRE', 
+    50: 'ESP', 51: 'AH', 58: 'ICMPv6', 88: 'EIGRP', 89: 'OSPF', 103: 'PIM', 112: 'VRRP', 
+    115: 'L2TP', 132: 'SCTP', 137: 'MPLS-in-IP'
+}
+
+def inet_to_str(inet):
+    """Convert inet object to a string"""
     try:
-        if not hasattr(packet, 'dns'):
-            return None
-        
-        print(f"[DNS EXTRACTION] Processing packet for DNS data...")
-        dns = packet.dns
-        
+        return socket.inet_ntop(socket.AF_INET, inet)
+    except ValueError:
+        return socket.inet_ntop(socket.AF_INET6, inet)
+
+def mac_addr(address):
+    """Convert a MAC address to a readable/printable string"""
+    return ':'.join('%02x' % b for b in address)
+
+def extract_dns_record(dns, ip_pkt, timestamp, pcap_id):
+    """Extract Zeek-style DNS log fields from a dpkt DNS object."""
+    try:
         # Basic packet info
-        src_ip = packet.ip.src if hasattr(packet, 'ip') else (packet.ipv6.src if hasattr(packet, 'ipv6') else '0.0.0.0')
-        dst_ip = packet.ip.dst if hasattr(packet, 'ip') else (packet.ipv6.dst if hasattr(packet, 'ipv6') else '0.0.0.0')
-        src_port = int(packet.udp.srcport) if hasattr(packet, 'udp') else (int(packet.tcp.srcport) if hasattr(packet, 'tcp') else 0)
-        dst_port = int(packet.udp.dstport) if hasattr(packet, 'udp') else (int(packet.tcp.dstport) if hasattr(packet, 'tcp') else 0)
-        proto = "udp" if hasattr(packet, 'udp') else ("tcp" if hasattr(packet, 'tcp') else "unknown")
+        src_ip = inet_to_str(ip_pkt.src)
+        dst_ip = inet_to_str(ip_pkt.dst)
         
-        trans_id = int(dns.id, 16) if isinstance(dns.id, str) else int(dns.id)
+        # Handle transport layer
+        if isinstance(ip_pkt.data, dpkt.udp.UDP) or isinstance(ip_pkt.data, dpkt.tcp.TCP):
+            src_port = ip_pkt.data.sport
+            dst_port = ip_pkt.data.dport
+            proto = "udp" if isinstance(ip_pkt.data, dpkt.udp.UDP) else "tcp"
+        else:
+            return None
+
+        trans_id = dns.id
         
         # Query details
-        query = getattr(dns, 'qry_name', '')
-        qtype_raw = getattr(dns, 'qry_type', '1')
-        qclass_raw = getattr(dns, 'qry_class', '1')
+        query = ''
+        qtype = 1
+        qclass = 1
         
-        qtype = int(qtype_raw)
+        if dns.qd:
+            q = dns.qd[0]
+            query = q.name
+            qtype = q.type
+            qclass = q.cls
+            
         qtype_name = DNS_QTYPE_MAP.get(qtype, str(qtype))
-        
-        qclass = int(qclass_raw, 16) if isinstance(qclass_raw, str) else int(qclass_raw)
         qclass_name = DNS_QCLASS_MAP.get(qclass, str(qclass))
         
         # Response code
-        rcode = int(getattr(dns, 'flags_rcode', '0'))
+        rcode = dns.rcode
         rcode_name = DNS_RCODE_MAP.get(rcode, str(rcode))
         
         # Flags
-        AA = getattr(dns, 'flags_authoritative', '0') == '1'
-        TC = getattr(dns, 'flags_truncated', '0') == '1'
-        RD = getattr(dns, 'flags_recdesired', '0') == '1'
-        RA = getattr(dns, 'flags_recavail', '0') == '1'
+        AA = (dns.op & dpkt.dns.DNS_AA) != 0
+        TC = (dns.op & dpkt.dns.DNS_TC) != 0
+        RD = (dns.op & dpkt.dns.DNS_RD) != 0
+        RA = (dns.op & dpkt.dns.DNS_RA) != 0
+        Z = (dns.op & dpkt.dns.DNS_Z) != 0 # Not exactly Z bit in dpkt, but close enough for now
         
-        # Handle Z flag - pyshark returns string "False"/"True" or "0"/"1"
-        Z_raw = getattr(dns, 'flags_z', '0')
-        if Z_raw in ('True', '1', 1):
-            Z = 1
-        else:
-            Z = 0
-        
-        # Robust answer and TTL extraction
+        # Answers
         answers = []
         ttls = []
         
-        # pyshark can present answers in many ways. We need to check for all common attributes.
-        # The `dns.answers` field is often a list of `DNSRR` objects.
-        if hasattr(dns, 'answers') and isinstance(dns.answers, list):
-            for answer in dns.answers:
-                try:
-                    if hasattr(answer, 'data'):
-                        answers.append(str(answer.data))
-                    elif hasattr(answer, 'cname'):
-                        answers.append(str(answer.cname))
-                    elif hasattr(answer, 'nsname'):
-                        answers.append(str(answer.nsname))
-                    elif hasattr(answer, 'mx_mail_exchange'):
-                        answers.append(str(answer.mx_mail_exchange))
-                    elif hasattr(answer, 'txt'):
-                        answers.append(str(answer.txt))
-                    
-                    if hasattr(answer, 'ttl'):
-                        ttls.append(int(answer.ttl))
-                except Exception as e:
-                    print(f"[DNS Answer Extraction] Error processing an answer object: {e}")
-
-        # Fallback for when `dns.answers` is not available or not a list
-        else:
-            # A/AAAA records
-            if hasattr(dns, 'a'):
-                answers.append(dns.a)
-                if hasattr(dns, 'a_ttl'): ttls.append(int(dns.a_ttl))
-            if hasattr(dns, 'aaaa'):
-                answers.append(dns.aaaa)
-                if hasattr(dns, 'aaaa_ttl'): ttls.append(int(dns.aaaa_ttl))
-            
-            # CNAME
-            if hasattr(dns, 'cname'):
-                answers.append(dns.cname)
-                if hasattr(dns, 'cname_ttl'): ttls.append(int(dns.cname_ttl))
-            
-            # MX
-            if hasattr(dns, 'mx_mail_exchange'):
-                answers.append(dns.mx_mail_exchange)
-                if hasattr(dns, 'mx_mail_exchange_ttl'): ttls.append(int(dns.mx_mail_exchange_ttl))
-            
-            # TXT
-            if hasattr(dns, 'txt'):
-                answers.append(dns.txt)
-                if hasattr(dns, 'txt_ttl'): ttls.append(int(dns.txt_ttl))
+        for ans in dns.an:
+            ttls.append(ans.ttl)
+            if ans.type == dpkt.dns.DNS_A:
+                answers.append(inet_to_str(ans.rdata))
+            elif ans.type == dpkt.dns.DNS_AAAA:
+                answers.append(inet_to_str(ans.rdata))
+            elif ans.type == dpkt.dns.DNS_CNAME:
+                answers.append(ans.cname)
+            elif ans.type == dpkt.dns.DNS_TXT:
+                answers.append(str(ans.text))
+            else:
+                # Fallback for other types
+                answers.append("...")
 
         uid = f"C{hash(f'{src_ip}{src_port}{dst_ip}{dst_port}{trans_id}{timestamp}') % 100000000:08x}"
         
@@ -134,322 +118,302 @@ def extract_dns_record(packet: Any, pcap_id: uuid.UUID, timestamp: datetime) -> 
             'AA': AA, 'TC': TC, 'RD': RD, 'RA': RA, 'Z': Z,
             'answers': answers, 'TTLs': ttls, 'rejected': False
         }
-        print(f"[DNS EXTRACTION SUCCESS] Extracted record: {record}")
         return record
         
     except Exception as e:
-        print(f"[DNS EXTRACTION FAILED] Packet: {packet.number}, Error: {e}")
-        import traceback
-        traceback.print_exc()
+        # print(f"[DNS EXTRACTION FAILED] Error: {e}")
         return None
-
-
-def extract_packet_info(packet: Any, pcap_id: uuid.UUID, packet_num_counter: int) -> Optional[Dict[str, Any]]:
-    """Extracts relevant information from a pyshark packet for ClickHouse insertion."""
-    try:
-        timestamp = packet.sniff_time.replace(tzinfo=None) if hasattr(packet, 'sniff_time') else datetime.now()
-        
-        src_ip_str = None
-        dst_ip_str = None
-        src_port = None
-        dst_port = None
-        # Determine protocol with sensible precedence (avoid generic DATA)
-        # Prefer well-known app layers over transport; fall back to transport; never 'DATA'
-        protocol = "Other"
-        try:
-            layer_names = [getattr(layer, 'layer_name', '').lower() for layer in getattr(packet, 'layers', [])]
-        except Exception:
-            layer_names = []
-
-        def has_layer(name: str) -> bool:
-            lname = name.lower()
-            return lname in layer_names or hasattr(packet, lname)
-
-        # Application protocols first
-        if has_layer('dns'):
-            protocol = 'DNS'
-        elif has_layer('http'):
-            protocol = 'HTTP'
-        elif any('tls' in n for n in layer_names):
-            protocol = 'TLS'
-        elif any('quic' in n for n in layer_names):
-            protocol = 'QUIC'
-        elif has_layer('icmp'):
-            protocol = 'ICMP'
-        elif has_layer('arp'):
-            protocol = 'ARP'
-        elif has_layer('smb') or has_layer('smb2'):
-            protocol = 'SMB'
-        elif has_layer('telnet'):
-            protocol = 'TELNET'
-        elif has_layer('ftp'):
-            protocol = 'FTP'
-        elif has_layer('ssh'):
-            protocol = 'SSH'
-        elif has_layer('ssdp'):
-            protocol = 'SSDP'
-        elif has_layer('sip'):
-            protocol = 'SIP'
-        # Transport next
-        elif has_layer('tcp'):
-            protocol = 'TCP'
-        elif has_layer('udp'):
-            protocol = 'UDP'
-        else:
-            # Fallback to highest_layer if available, but normalize to avoid DATA
-            protocol = getattr(packet, 'highest_layer', 'Other')
-            if isinstance(protocol, str):
-                protocol = protocol.upper()
-            if protocol == 'DATA':
-                # Map generic DATA to transport if available
-                if has_layer('tcp'):
-                    protocol = 'TCP'
-                elif has_layer('udp'):
-                    protocol = 'UDP'
-                else:
-                    protocol = 'Other'
-        length = int(packet.length) if hasattr(packet, 'length') else 0
-        
-        if hasattr(packet, 'ip'):
-            src_ip_str = packet.ip.src
-            dst_ip_str = packet.ip.dst
-        elif hasattr(packet, 'ipv6'):
-            # ClickHouse IPv4 type cannot store IPv6, so we'll default to 0.0.0.0 for IPv6
-            # If you need IPv6, change the table schema to IPv6 type
-            src_ip_str = '0.0.0.0' # Placeholder for IPv6 if table is IPv4
-            dst_ip_str = '0.0.0.0' # Placeholder for IPv6 if table is IPv4
-
-        if hasattr(packet, 'tcp'):
-            src_port = int(packet.tcp.srcport)
-            dst_port = int(packet.tcp.dstport)
-        elif hasattr(packet, 'udp'):
-            src_port = int(packet.udp.srcport)
-            dst_port = int(packet.udp.dstport)
-
-        # Ensure IP addresses are valid for IPv4 type, default to 0.0.0.0 if not present or IPv6
-        def is_valid_ipv4(ip_str):
-            if not ip_str: return False
-            parts = ip_str.split('.')
-            if len(parts) != 4: return False
-            for part in parts:
-                if not part.isdigit() or not (0 <= int(part) <= 255): return False
-            return True
-
-        src_ip_final = src_ip_str if is_valid_ipv4(src_ip_str) else '0.0.0.0'
-        dst_ip_final = dst_ip_str if is_valid_ipv4(dst_ip_str) else '0.0.0.0'
-
-        # Create a Wireshark-style info string based on protocol
-        info_str = ""
-        try:
-            if protocol == 'DNS':
-                # DNS specific info
-                if hasattr(packet, 'dns'):
-                    if hasattr(packet.dns, 'qry_name'):
-                        query_type = getattr(packet.dns, 'qry_type', 'A')
-                        info_str = f"Standard query {query_type} {packet.dns.qry_name}"
-                    elif hasattr(packet.dns, 'resp_name'):
-                        info_str = f"Standard query response"
-                    else:
-                        info_str = "DNS query/response"
-            elif protocol == 'HTTP':
-                # HTTP specific info
-                if hasattr(packet, 'http'):
-                    if hasattr(packet.http, 'request_method'):
-                        method = packet.http.request_method
-                        uri = getattr(packet.http, 'request_uri', '/')
-                        info_str = f"{method} {uri}"
-                    elif hasattr(packet.http, 'response_code'):
-                        code = packet.http.response_code
-                        phrase = getattr(packet.http, 'response_phrase', '')
-                        info_str = f"HTTP/{getattr(packet.http, 'response_version', '1.1')} {code} {phrase}"
-                    else:
-                        info_str = "HTTP"
-            elif protocol == 'TLS' or protocol == 'SSL':
-                # TLS specific info
-                if hasattr(packet, 'tls'):
-                    if hasattr(packet.tls, 'handshake_type'):
-                        handshake_type = packet.tls.handshake_type
-                        if handshake_type == '1':
-                            info_str = "Client Hello"
-                        elif handshake_type == '2':
-                            info_str = "Server Hello"
-                        elif handshake_type == '11':
-                            info_str = "Certificate"
-                        else:
-                            info_str = f"Handshake ({handshake_type})"
-                    else:
-                        info_str = "Application Data"
-            elif protocol == 'TCP':
-                # TCP specific info with flags
-                if hasattr(packet, 'tcp'):
-                    flags = []
-                    if hasattr(packet.tcp, 'flags_syn') and packet.tcp.flags_syn == 'True':
-                        flags.append('SYN')
-                    if hasattr(packet.tcp, 'flags_ack') and packet.tcp.flags_ack == 'True':
-                        flags.append('ACK')
-                    if hasattr(packet.tcp, 'flags_fin') and packet.tcp.flags_fin == 'True':
-                        flags.append('FIN')
-                    if hasattr(packet.tcp, 'flags_reset') and packet.tcp.flags_reset == 'True':
-                        flags.append('RST')
-                    if hasattr(packet.tcp, 'flags_push') and packet.tcp.flags_push == 'True':
-                        flags.append('PSH')
-                    
-                    seq = getattr(packet.tcp, 'seq', '')
-                    ack = getattr(packet.tcp, 'ack', '')
-                    win = getattr(packet.tcp, 'window_size_value', '')
-                    
-                    flag_str = ','.join(flags) if flags else 'None'
-                    info_str = f"{src_port} → {dst_port} [{flag_str}] Seq={seq} Ack={ack} Win={win} Len={length}"
-            elif protocol == 'UDP':
-                # UDP specific info
-                info_str = f"{src_port} → {dst_port} Len={length}"
-            elif protocol == 'ARP':
-                # ARP specific info
-                if hasattr(packet, 'arp'):
-                    if hasattr(packet.arp, 'opcode'):
-                        opcode = packet.arp.opcode
-                        if opcode == '1':
-                            info_str = f"Who has {getattr(packet.arp, 'dst_proto_ipv4', '?')}? Tell {getattr(packet.arp, 'src_proto_ipv4', '?')}"
-                        elif opcode == '2':
-                            info_str = f"{getattr(packet.arp, 'src_proto_ipv4', '?')} is at {getattr(packet.arp, 'src_hw_mac', '?')}"
-            elif protocol == 'ICMP':
-                # ICMP specific info
-                if hasattr(packet, 'icmp'):
-                    icmp_type = getattr(packet.icmp, 'type', '')
-                    if icmp_type == '8':
-                        info_str = f"Echo (ping) request"
-                    elif icmp_type == '0':
-                        info_str = f"Echo (ping) reply"
-                    else:
-                        info_str = f"ICMP Type {icmp_type}"
-            
-            # Fallback to generic info if nothing specific was set
-            if not info_str:
-                info_str = f"{protocol}"
-                if src_ip_final != '0.0.0.0' and dst_ip_final != '0.0.0.0':
-                    info_str += f" {src_ip_final}"
-                    if src_port: info_str += f":{src_port}"
-                    info_str += f" → {dst_ip_final}"
-                    if dst_port: info_str += f":{dst_port}"
-                info_str += f" Len={length}"
-        except Exception as e:
-            # Fallback on any error
-            info_str = f"{protocol} packet from {src_ip_final}:{src_port or 0} to {dst_ip_final}:{dst_port or 0} (len={length})"
-
-        # Extract all layers as JSON for detailed view
-        layers_data = []
-        for layer in packet.layers:
-            layer_fields = {}
-            for field_name in layer.field_names:
-                try:
-                    layer_fields[field_name] = getattr(layer, field_name)
-                except AttributeError:
-                    pass # Some fields might not be directly accessible
-            layers_data.append({"name": layer.layer_name, "fields": layer_fields})
-        layers_json = json.dumps(layers_data)
-
-        return {
-            "pcap_id": pcap_id,
-            "ts": timestamp,
-            "packet_number": packet_num_counter,
-            "src_ip": src_ip_final,
-            "dst_ip": dst_ip_final,
-            "src_port": src_port if src_port is not None else 0,
-            "dst_port": dst_port if dst_port is not None else 0,
-            "protocol": protocol,
-            "length": length,
-            "file_offset": 0, # pyshark doesn't easily provide this, setting to 0
-            "info": info_str,
-            "layers_json": layers_json
-        }
-    except Exception as e:
-        print(f"Error extracting packet info: {e}")
-        return None
-
-def get_total_packets(file_path: Path) -> int:
-    """Quickly count the number of packets in a PCAP file."""
-    try:
-        cap = pyshark.FileCapture(str(file_path))
-        count = sum(1 for _ in cap)
-        cap.close()
-        return count
-    except Exception as e:
-        print(f"Error counting packets: {e}")
-        return 0
 
 def parse_and_ingest_pcap_sync(file_path: Path, pcap_id: uuid.UUID, original_filename: str, task_id: str, progress_dict: Dict[str, Any]):
-    """Synchronously parses a PCAP file and ingests data into ClickHouse."""
-    cap = None
+    """Synchronously parses a PCAP file using dpkt and ingests data into ClickHouse."""
     packets_to_insert_dicts = []
     dns_records_to_insert = []
     packet_count = 0
     total_bytes = 0
     start_time = None
     end_time = None
-    batch_size = 1000 # Insert in batches
-    dns_batch_size = 500
+    batch_size = 5000 # Larger batch size for speed
+    dns_batch_size = 1000
 
-    print(f"[ClickHouse Ingestion] Attempting to open PCAP: {file_path}")
+    print(f"[ClickHouse Ingestion] Attempting to parse PCAP with dpkt: {file_path}")
+    
     try:
-        total_packets = get_total_packets(file_path)
-        if total_packets == 0:
-            raise ValueError("PCAP file is empty or could not be read.")
+        if not file_path.exists():
+            raise ValueError(f"PCAP file does not exist: {file_path}")
+        
+        file_size = file_path.stat().st_size
+        if file_size == 0:
+            raise ValueError("Uploaded file is empty.")
 
-        cap = pyshark.FileCapture(str(file_path))
-        print(f"[ClickHouse Ingestion] PCAP file opened successfully.")
+        f = open(file_path, 'rb')
+        try:
+            pcap = dpkt.pcap.Reader(f)
+        except ValueError:
+            # Try pcapng if pcap fails (requires newer dpkt or fallback)
+            # dpkt 1.9.x doesn't support pcapng well, but let's try just in case or fallback
+            f.seek(0)
+            try:
+                # Basic check for pcapng magic number
+                magic = f.read(4)
+                if magic == b'\x0a\x0d\x0d\x0a':
+                     # It is pcapng. dpkt might not support it.
+                     # We will fallback to tshark -T ek if dpkt fails, but let's assume pcap for now
+                     # or try to use a pcapng library if available.
+                     # For now, let's assume standard pcap or that dpkt handles it.
+                     pass
+                f.seek(0)
+                pcap = dpkt.pcap.Reader(f)
+            except Exception as e:
+                print(f"dpkt failed to open file: {e}")
+                raise ValueError("Invalid PCAP file or format not supported by dpkt.")
 
-        packet_num_counter = 0 # Initialize packet number counter
-        for packet in cap:
-            packet_num_counter += 1 # Increment for each packet
+        packet_num_counter = 0
+        
+        # Estimate total packets for progress (avg packet size ~800 bytes?)
+        estimated_packets = file_size / 800 
+        
+        for ts, buf in pcap:
+            # Check for cancellation
+            if task_id in progress_dict and progress_dict[task_id].get('status') == 'cancelled':
+                print(f"[ClickHouse Ingestion] Task {task_id} cancelled. Cleaning up...")
+                try:
+                    client = get_ch_client()
+                    client.command(f"ALTER TABLE packets DELETE WHERE pcap_id = '{pcap_id}'")
+                    client.command(f"ALTER TABLE dns_log DELETE WHERE pcap_id = '{pcap_id}'")
+                except Exception as cleanup_error:
+                    print(f"Cleanup failed: {cleanup_error}")
+                return
+
+            packet_num_counter += 1
             packet_count += 1
-            total_bytes += int(packet.length) if hasattr(packet, 'length') else 0
-
-            if hasattr(packet, 'sniff_time'):
-                current_time = packet.sniff_time.replace(tzinfo=None)
-                if start_time is None: start_time = current_time
-                end_time = current_time
-
-            packet_data = extract_packet_info(packet, pcap_id, packet_num_counter) # Pass counter
-            if packet_data:
-                packets_to_insert_dicts.append(packet_data)
+            timestamp = datetime.fromtimestamp(ts)
+            length = len(buf)
+            total_bytes += length
             
-            # Extract DNS log if packet is DNS
-            if packet_data and packet_data['protocol'] == 'DNS':
-                dns_record = extract_dns_record(packet, pcap_id, packet_data['ts'])
-                if dns_record:
-                    dns_records_to_insert.append(dns_record)
+            if start_time is None: start_time = timestamp
+            end_time = timestamp
 
+            # Parse Ethernet
+            try:
+                eth = dpkt.ethernet.Ethernet(buf)
+            except:
+                continue
+
+            # Default values
+            src_ip_str = '0.0.0.0'
+            dst_ip_str = '0.0.0.0'
+            src_port = 0
+            dst_port = 0
+            protocol = 'Other'
+            info_str = ''
+            
+            # Unwrap VLANs and MPLS to find IP
+            pkt = eth
+            while hasattr(pkt, 'type') and pkt.type in (dpkt.ethernet.ETH_TYPE_8021Q, dpkt.ethernet.ETH_TYPE_8021AD, dpkt.ethernet.ETH_TYPE_MPLS, dpkt.ethernet.ETH_TYPE_MPLS_MCAST):
+                if hasattr(pkt, 'data'):
+                    pkt = pkt.data
+                else:
+                    break
+
+            # IP Layer
+            ip_pkt = None
+            if hasattr(pkt, 'data') and (isinstance(pkt.data, dpkt.ip.IP) or isinstance(pkt.data, dpkt.ip6.IP6)):
+                ip_pkt = pkt.data
+                src_ip_str = inet_to_str(ip_pkt.src)
+                dst_ip_str = inet_to_str(ip_pkt.dst)
+                
+                # Try to resolve protocol name from number if not yet set
+                if protocol == 'Other':
+                    protocol = IP_PROTOCOLS.get(ip_pkt.p, f'Proto-{ip_pkt.p}')
+
+                if isinstance(ip_pkt.data, dpkt.tcp.TCP):
+                    protocol = 'TCP'
+                    src_port = ip_pkt.data.sport
+                    dst_port = ip_pkt.data.dport
+                    flags = []
+                    if ip_pkt.data.flags & dpkt.tcp.TH_SYN: flags.append('SYN')
+                    if ip_pkt.data.flags & dpkt.tcp.TH_ACK: flags.append('ACK')
+                    if ip_pkt.data.flags & dpkt.tcp.TH_RST: flags.append('RST')
+                    if ip_pkt.data.flags & dpkt.tcp.TH_FIN: flags.append('FIN')
+                    if ip_pkt.data.flags & dpkt.tcp.TH_PUSH: flags.append('PSH')
+                    info_str = f"{src_port} -> {dst_port} [{' '.join(flags)}] Seq={ip_pkt.data.seq} Ack={ip_pkt.data.ack}"
+                    
+                    # Check for HTTP/TLS/SSH based on ports (heuristic)
+                    if src_port == 80 or dst_port == 80 or src_port == 8080 or dst_port == 8080:
+                        protocol = 'HTTP'
+                        try:
+                            if src_port == 80 or src_port == 8080:
+                                http = dpkt.http.Response(ip_pkt.data.data)
+                                info_str = f"HTTP {http.status} {http.reason}"
+                            else:
+                                http = dpkt.http.Request(ip_pkt.data.data)
+                                info_str = f"{http.method} {http.uri}"
+                        except:
+                            pass
+                    elif src_port == 443 or dst_port == 443:
+                        protocol = 'TLS'
+                        info_str = "Application Data"
+                    elif src_port == 22 or dst_port == 22:
+                        protocol = 'SSH'
+                        info_str = "Encrypted Packet"
+                    
+                    # Check for DNS over TCP
+                    if src_port in (53, 5353, 5355) or dst_port in (53, 5353, 5355):
+                        protocol = 'DNS'
+                        try:
+                            # DNS over TCP has a 2-byte length prefix which dpkt.dns.DNS doesn't handle automatically
+                            # We need to skip it if parsing directly
+                            dns_data = ip_pkt.data.data
+                            if len(dns_data) > 2:
+                                # Try parsing without length prefix
+                                try:
+                                    dns = dpkt.dns.DNS(dns_data[2:])
+                                except:
+                                    # Fallback to raw
+                                    dns = dpkt.dns.DNS(dns_data)
+                                
+                                if dns.qd:
+                                    info_str = f"Standard query {dns.qd[0].name}"
+                                elif dns.an:
+                                    info_str = f"Standard query response {dns.an[0].name if hasattr(dns.an[0], 'name') else ''}"
+                                
+                                dns_record = extract_dns_record(dns, ip_pkt, timestamp, pcap_id)
+                                if dns_record:
+                                    dns_records_to_insert.append(dns_record)
+                        except Exception as e:
+                            # print(f"DNS TCP Parse Error: {e}")
+                            pass
+
+                elif isinstance(ip_pkt.data, dpkt.udp.UDP):
+                    protocol = 'UDP'
+                    src_port = ip_pkt.data.sport
+                    dst_port = ip_pkt.data.dport
+                    info_str = f"{src_port} -> {dst_port} Len={ip_pkt.data.ulen}"
+                    
+                    # Check for DNS (53), mDNS (5353), LLMNR (5355), NBNS (137)
+                    if src_port in (53, 5353, 5355, 137) or dst_port in (53, 5353, 5355, 137):
+                        if src_port == 5353 or dst_port == 5353:
+                            protocol = 'mDNS'
+                        elif src_port == 5355 or dst_port == 5355:
+                            protocol = 'LLMNR'
+                        elif src_port == 137 or dst_port == 137:
+                            protocol = 'NBNS'
+                        else:
+                            protocol = 'DNS'
+                            
+                        try:
+                            dns = dpkt.dns.DNS(ip_pkt.data.data)
+                            if dns.qd:
+                                info_str = f"Standard query {dns.qd[0].name}"
+                            elif dns.an:
+                                info_str = f"Standard query response {dns.an[0].name if hasattr(dns.an[0], 'name') else ''}"
+                            
+                            # Extract DNS record
+                            dns_record = extract_dns_record(dns, ip_pkt, timestamp, pcap_id)
+                            if dns_record:
+                                dns_records_to_insert.append(dns_record)
+                        except Exception as e:
+                            # print(f"DNS UDP Parse Error: {e}")
+                            info_str += " (Malformed DNS)"
+                            pass
+                    elif src_port == 67 or dst_port == 67 or src_port == 68 or dst_port == 68:
+                        protocol = 'DHCP'
+                    elif src_port == 123 or dst_port == 123:
+                        protocol = 'NTP'
+                    elif src_port == 1900 or dst_port == 1900:
+                        protocol = 'SSDP'
+
+                elif isinstance(ip_pkt.data, dpkt.icmp.ICMP):
+                    protocol = 'ICMP'
+                    info_str = f"Type={ip_pkt.data.type} Code={ip_pkt.data.code}"
+            
+            elif isinstance(eth.data, dpkt.arp.ARP):
+                protocol = 'ARP'
+                info_str = f"Who has {inet_to_str(eth.data.tpa)}? Tell {inet_to_str(eth.data.spa)}"
+
+            # Construct a simplified layers_json for frontend compatibility
+            # We can't easily replicate tshark's full structure, but we can provide enough for basic display
+            layers_data = [
+                {
+                    "name": "frame",
+                    "fields": {
+                        "frame.time": timestamp.isoformat(),
+                        "frame.len": length,
+                        "frame.number": packet_num_counter,
+                        "frame.protocols": protocol.lower()
+                    }
+                },
+                {
+                    "name": "eth",
+                    "fields": {
+                        "eth.src": mac_addr(eth.src),
+                        "eth.dst": mac_addr(eth.dst),
+                        "eth.type": eth.type
+                    }
+                }
+            ]
+            
+            if ip_pkt:
+                ip_version = "ip" if isinstance(ip_pkt, dpkt.ip.IP) else "ipv6"
+                layers_data.append({
+                    "name": ip_version,
+                    "fields": {
+                        f"{ip_version}.src": src_ip_str,
+                        f"{ip_version}.dst": dst_ip_str,
+                        f"{ip_version}.len": ip_pkt.len,
+                        f"{ip_version}.ttl": ip_pkt.ttl
+                    }
+                })
+                
+                if protocol == 'TCP':
+                    layers_data.append({
+                        "name": "tcp",
+                        "fields": {
+                            "tcp.srcport": src_port,
+                            "tcp.dstport": dst_port,
+                            "tcp.seq": ip_pkt.data.seq,
+                            "tcp.ack": ip_pkt.data.ack,
+                            "tcp.flags": ip_pkt.data.flags
+                        }
+                    })
+                elif protocol == 'UDP':
+                    layers_data.append({
+                        "name": "udp",
+                        "fields": {
+                            "udp.srcport": src_port,
+                            "udp.dstport": dst_port,
+                            "udp.length": ip_pkt.data.ulen
+                        }
+                    })
+            
+            layers_json = json.dumps(layers_data)
+
+            packets_to_insert_dicts.append({
+                "ts": timestamp, "pcap_id": pcap_id, "packet_number": packet_num_counter,
+                "src_ip": src_ip_str, "dst_ip": dst_ip_str, "src_port": src_port,
+                "dst_port": dst_port, "protocol": protocol, "length": length,
+                "file_offset": 0, "info": info_str, "layers_json": layers_json
+            })
+
+            # Batch Insert
             if len(packets_to_insert_dicts) >= batch_size:
-                # Convert dicts to tuples in the correct order for ClickHouse insertion
                 rows = []
                 for r in packets_to_insert_dicts:
                     rows.append((
-                        r["ts"],
-                        r["pcap_id"],
-                        r["packet_number"],
-                        r["src_ip"],
-                        r["dst_ip"],
-                        r["src_port"],
-                        r["dst_port"],
-                        r["protocol"],
-                        r["length"],
-                        r["file_offset"],
-                        r["info"],
-                        r["layers_json"],
+                        r["ts"], r["pcap_id"], r["packet_number"], r["src_ip"], r["dst_ip"], 
+                        r["src_port"], r["dst_port"], r["protocol"], r["length"], 
+                        r["file_offset"], r["info"], r["layers_json"]
                     ))
-                
-                print(f"[ClickHouse Ingestion] Inserting batch of {len(rows)} packets")
-                get_ch_client().insert(
-                    'packets',
-                    rows,
-                    column_names=[
-                        "ts", "pcap_id", "packet_number", "src_ip", "dst_ip", "src_port", 
-                        "dst_port", "protocol", "length", "file_offset", "info", "layers_json"
-                    ]
-                )
+                get_ch_client().insert('packets', rows, column_names=[
+                    "ts", "pcap_id", "packet_number", "src_ip", "dst_ip", "src_port", 
+                    "dst_port", "protocol", "length", "file_offset", "info", "layers_json"
+                ])
                 packets_to_insert_dicts = []
                 
-            # Insert DNS records batch
+                # Update progress (approximate)
+                progress = min(99, (packet_num_counter / estimated_packets) * 100) if estimated_packets > 0 else 0
+                progress_dict[task_id] = {'status': 'processing', 'progress': progress}
+
             if len(dns_records_to_insert) >= dns_batch_size:
                 dns_rows = []
                 for d in dns_records_to_insert:
@@ -460,53 +424,29 @@ def parse_and_ingest_pcap_sync(file_path: Path, pcap_id: uuid.UUID, original_fil
                         d['rcode'], d['rcode_name'], d['AA'], d['TC'], d['RD'], d['RA'],
                         d['Z'], d['answers'], d['TTLs'], d['rejected']
                     ))
-                get_ch_client().insert(
-                    'dns_log',
-                    dns_rows,
-                    column_names=[
-                        'ts', 'uid', 'pcap_id', 'id_orig_h', 'id_orig_p',
-                        'id_resp_h', 'id_resp_p', 'proto', 'trans_id',
-                        'query', 'qclass', 'qclass_name', 'qtype', 'qtype_name',
-                        'rcode', 'rcode_name', 'AA', 'TC', 'RD', 'RA',
-                        'Z', 'answers', 'TTLs', 'rejected'
-                    ]
-                )
-                print(f"[ClickHouse Ingestion] Inserted {len(dns_rows)} DNS records")
+                get_ch_client().insert('dns_log', dns_rows, column_names=[
+                    'ts', 'uid', 'pcap_id', 'id_orig_h', 'id_orig_p',
+                    'id_resp_h', 'id_resp_p', 'proto', 'trans_id',
+                    'query', 'qclass', 'qclass_name', 'qtype', 'qtype_name',
+                    'rcode', 'rcode_name', 'AA', 'TC', 'RD', 'RA',
+                    'Z', 'answers', 'TTLs', 'rejected'
+                ])
                 dns_records_to_insert = []
-            
-            # Update progress
-            progress = (packet_num_counter / total_packets) * 100
-            progress_dict[task_id] = {'status': 'processing', 'progress': progress}
 
-        # Insert any remaining packets
+        # Final Batch
         if packets_to_insert_dicts:
             rows = []
             for r in packets_to_insert_dicts:
                 rows.append((
-                    r["ts"],
-                    r["pcap_id"],
-                    r["packet_number"],
-                    r["src_ip"],
-                    r["dst_ip"],
-                    r["src_port"],
-                    r["dst_port"],
-                    r["protocol"],
-                    r["length"],
-                    r["file_offset"],
-                    r["info"],
-                    r["layers_json"],
+                    r["ts"], r["pcap_id"], r["packet_number"], r["src_ip"], r["dst_ip"], 
+                    r["src_port"], r["dst_port"], r["protocol"], r["length"], 
+                    r["file_offset"], r["info"], r["layers_json"]
                 ))
-            print(f"[ClickHouse Ingestion] Inserting final batch of {len(rows)} packets")
-            get_ch_client().insert(
-                'packets',
-                rows,
-                column_names=[
-                    "ts", "pcap_id", "packet_number", "src_ip", "dst_ip", "src_port", 
-                    "dst_port", "protocol", "length", "file_offset", "info", "layers_json"
-                ]
-            )
-        
-        # Insert remaining DNS records
+            get_ch_client().insert('packets', rows, column_names=[
+                "ts", "pcap_id", "packet_number", "src_ip", "dst_ip", "src_port", 
+                "dst_port", "protocol", "length", "file_offset", "info", "layers_json"
+            ])
+
         if dns_records_to_insert:
             dns_rows = []
             for d in dns_records_to_insert:
@@ -517,18 +457,13 @@ def parse_and_ingest_pcap_sync(file_path: Path, pcap_id: uuid.UUID, original_fil
                     d['rcode'], d['rcode_name'], d['AA'], d['TC'], d['RD'], d['RA'],
                     d['Z'], d['answers'], d['TTLs'], d['rejected']
                 ))
-            get_ch_client().insert(
-                'dns_log',
-                dns_rows,
-                column_names=[
-                    'ts', 'uid', 'pcap_id', 'id_orig_h', 'id_orig_p',
-                    'id_resp_h', 'id_resp_p', 'proto', 'trans_id',
-                    'query', 'qclass', 'qclass_name', 'qtype', 'qtype_name',
-                    'rcode', 'rcode_name', 'AA', 'TC', 'RD', 'RA',
-                    'Z', 'answers', 'TTLs', 'rejected'
-                ]
-            )
-            print(f"[ClickHouse Ingestion] Inserted final {len(dns_rows)} DNS records")
+            get_ch_client().insert('dns_log', dns_rows, column_names=[
+                'ts', 'uid', 'pcap_id', 'id_orig_h', 'id_orig_p',
+                'id_resp_h', 'id_resp_p', 'proto', 'trans_id',
+                'query', 'qclass', 'qclass_name', 'qtype', 'qtype_name',
+                'rcode', 'rcode_name', 'AA', 'TC', 'RD', 'RA',
+                'Z', 'answers', 'TTLs', 'rejected'
+            ])
 
         capture_duration = (end_time - start_time).total_seconds() if start_time and end_time else 0.0
 
@@ -553,12 +488,7 @@ def parse_and_ingest_pcap_sync(file_path: Path, pcap_id: uuid.UUID, original_fil
 
         progress_dict[task_id] = {'status': 'completed', 'progress': 100, 'file_id': str(pcap_id)}
 
-        return {"file_id": str(pcap_id), "total_packets": packet_count, "total_bytes": total_bytes}
-
     except Exception as e:
         progress_dict[task_id] = {'status': 'error', 'message': str(e)}
         print(f"[ClickHouse Ingestion] Error during ingestion: {e}")
         raise e
-    finally:
-        if cap:
-            cap.close()

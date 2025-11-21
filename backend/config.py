@@ -4,7 +4,7 @@ import os
 CH_HOST = (
 	os.getenv("CH_HOST")
 	or os.getenv("CLICKHOUSE_HOST")
-	or "clickhouse"
+	or "localhost"
 )
 # Prefer explicit HTTP port; fallback to CH_PORT; default 8123 for HTTP client
 CH_PORT = int(
@@ -13,7 +13,7 @@ CH_PORT = int(
 	or os.getenv("CLICKHOUSE_PORT", 8123)
 )
 CH_USER = os.getenv("CH_USER") or os.getenv("CLICKHOUSE_USER", "default")
-CH_PASSWORD = os.getenv("CH_PASSWORD") or os.getenv("CLICKHOUSE_PASSWORD", "")
+CH_PASSWORD = os.getenv("CH_PASSWORD") or os.getenv("CLICKHOUSE_PASSWORD", "password")
 CH_DATABASE = (
 	os.getenv("CH_DATABASE")
 	or os.getenv("CLICKHOUSE_DATABASE")

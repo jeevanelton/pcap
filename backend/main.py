@@ -114,14 +114,13 @@ class ProjectCreateRequest(BaseModel):
 
 @app.post("/api/auth/signup", response_model=TokenResponse)
 async def signup(payload: SignupRequest):
-    exists = get_ch_client().query(f"SELECT COUNT() FROM users WHERE email = '{payload.email}'").result_rows[0][0]
+    exists = get_ch_client().query("SELECT COUNT() FROM users WHERE email = {email:String}", parameters={'email': payload.email}).result_rows[0][0]
     if exists:
         raise HTTPException(status_code=400, detail="Email already registered")
     user_id = str(uuid.uuid4())
     get_ch_client().command(
-        f"""
-        INSERT INTO users (id, email, password_hash) VALUES ('{user_id}', '{payload.email}', '{hash_password(payload.password)}')
-        """
+        "INSERT INTO users (id, email, password_hash) VALUES ({id:String}, {email:String}, {password_hash:String})",
+        parameters={'id': user_id, 'email': payload.email, 'password_hash': hash_password(payload.password)}
     )
     token = create_access_token({"sub": user_id}, expires_delta=timedelta(days=7))
     return TokenResponse(access_token=token)
@@ -140,13 +139,13 @@ async def me(current_user: dict = Depends(get_current_user)):
 
 @app.get("/api/projects")
 async def list_projects(current_user: dict = Depends(get_current_user)):
-    res = get_ch_client().query(f"SELECT id, name, created_at FROM projects WHERE user_id = '{current_user['id']}' ORDER BY created_at DESC")
+    res = get_ch_client().query("SELECT id, name, created_at FROM projects WHERE user_id = {user_id:String} ORDER BY created_at DESC", parameters={'user_id': current_user['id']})
     return [{"id": str(r[0]), "name": r[1], "created_at": r[2].isoformat()} for r in res.result_rows]
 
 @app.post("/api/projects")
 async def create_project(payload: ProjectCreateRequest, current_user: dict = Depends(get_current_user)):
     pid = str(uuid.uuid4())
-    get_ch_client().command(f"INSERT INTO projects (id, user_id, name) VALUES ('{pid}', '{current_user['id']}', '{payload.name}')")
+    get_ch_client().command("INSERT INTO projects (id, user_id, name) VALUES ({id:String}, {user_id:String}, {name:String})", parameters={'id': pid, 'user_id': current_user['id'], 'name': payload.name})
     return {"id": pid, "name": payload.name}
 
 @app.delete("/api/projects/{project_id}")
@@ -155,13 +154,14 @@ async def delete_project(project_id: str, current_user: dict = Depends(get_curre
     client = get_ch_client()
     # Find all pcaps mapped to this project for this user
     pcaps = client.query(
-        f"SELECT pcap_id FROM pcap_project_map WHERE user_id = '{current_user['id']}' AND project_id = '{project_id}'"
+        "SELECT pcap_id FROM pcap_project_map WHERE user_id = {user_id:String} AND project_id = {project_id:String}",
+        parameters={'user_id': current_user['id'], 'project_id': project_id}
     ).result_rows
     for (pcap_id,) in pcaps:
         try:
-            client.command(f"ALTER TABLE packets DELETE WHERE pcap_id = '{pcap_id}'")
-            client.command(f"ALTER TABLE dns_log DELETE WHERE pcap_id = '{pcap_id}'")
-            client.command(f"ALTER TABLE pcap_metadata DELETE WHERE id = '{pcap_id}'")
+            client.command("ALTER TABLE packets DELETE WHERE pcap_id = {pcap_id:String}", parameters={'pcap_id': str(pcap_id)})
+            client.command("ALTER TABLE dns_log DELETE WHERE pcap_id = {pcap_id:String}", parameters={'pcap_id': str(pcap_id)})
+            client.command("ALTER TABLE pcap_metadata DELETE WHERE id = {pcap_id:String}", parameters={'pcap_id': str(pcap_id)})
             # Remove file from disk
             file_path = UPLOAD_DIR / f"{pcap_id}.pcap"
             if file_path.exists():
@@ -169,20 +169,20 @@ async def delete_project(project_id: str, current_user: dict = Depends(get_curre
         except Exception as e:
             print(f"[Project Delete] Error cleaning pcap {pcap_id}: {e}")
     # Remove mappings and the project record
-    client.command(f"ALTER TABLE pcap_project_map DELETE WHERE user_id = '{current_user['id']}' AND project_id = '{project_id}'")
-    client.command(f"ALTER TABLE projects DELETE WHERE user_id = '{current_user['id']}' AND id = '{project_id}'")
+    client.command("ALTER TABLE pcap_project_map DELETE WHERE user_id = {user_id:String} AND project_id = {project_id:String}", parameters={'user_id': current_user['id'], 'project_id': project_id})
+    client.command("ALTER TABLE projects DELETE WHERE user_id = {user_id:String} AND id = {project_id:String}", parameters={'user_id': current_user['id'], 'project_id': project_id})
     return {"ok": True, "deleted_pcaps": len(pcaps)}
 
 @app.get("/api/projects/{project_id}/files")
 async def list_project_files(project_id: str, current_user: dict = Depends(get_current_user)):
-    query = f"""
+    query = """
     SELECT m.id, m.file_name, m.upload_time, m.total_packets, m.file_size, m.capture_duration
     FROM pcap_project_map map
     INNER JOIN pcap_metadata m ON map.pcap_id = m.id
-    WHERE map.user_id = '{current_user['id']}' AND map.project_id = '{project_id}'
+    WHERE map.user_id = {user_id:String} AND map.project_id = {project_id:String}
     ORDER BY m.upload_time DESC
     """
-    res = get_ch_client().query(query)
+    res = get_ch_client().query(query, parameters={'user_id': current_user['id'], 'project_id': project_id})
     return [{
         "file_id": str(r[0]),
         "filename": r[1],
@@ -197,7 +197,8 @@ async def upload_pcap_to_project(project_id: str, background_tasks: BackgroundTa
     try:
         # Authorization and validation
         owns = get_ch_client().query(
-            f"SELECT COUNT() FROM projects WHERE id = '{project_id}' AND user_id = '{current_user['id']}'"
+            "SELECT COUNT() FROM projects WHERE id = {project_id:String} AND user_id = {user_id:String}",
+            parameters={'project_id': project_id, 'user_id': current_user['id']}
         ).result_rows[0][0]
         if not owns:
             raise HTTPException(status_code=403, detail="Not authorized for this project")
@@ -205,16 +206,16 @@ async def upload_pcap_to_project(project_id: str, background_tasks: BackgroundTa
             raise HTTPException(status_code=400, detail="Invalid file format. Only .pcap and .pcapng allowed")
 
         # Get existing files in this project
-        existing_files_query = f"SELECT pcap_id FROM pcap_project_map WHERE project_id = '{project_id}' AND user_id = '{current_user['id']}'"
-        existing_files = get_ch_client().query(existing_files_query).result_rows
+        existing_files_query = "SELECT pcap_id FROM pcap_project_map WHERE project_id = {project_id:String} AND user_id = {user_id:String}"
+        existing_files = get_ch_client().query(existing_files_query, parameters={'project_id': project_id, 'user_id': current_user['id']}).result_rows
 
         # Delete old PCAP data and files
         for (old_pcap_id,) in existing_files:
             try:
-                get_ch_client().command(f"ALTER TABLE packets DELETE WHERE pcap_id = '{old_pcap_id}'")
-                get_ch_client().command(f"ALTER TABLE dns_log DELETE WHERE pcap_id = '{old_pcap_id}'")
-                get_ch_client().command(f"ALTER TABLE pcap_metadata DELETE WHERE id = '{old_pcap_id}'")
-                get_ch_client().command(f"ALTER TABLE pcap_project_map DELETE WHERE pcap_id = '{old_pcap_id}'")
+                get_ch_client().command("ALTER TABLE packets DELETE WHERE pcap_id = {pcap_id:String}", parameters={'pcap_id': str(old_pcap_id)})
+                get_ch_client().command("ALTER TABLE dns_log DELETE WHERE pcap_id = {pcap_id:String}", parameters={'pcap_id': str(old_pcap_id)})
+                get_ch_client().command("ALTER TABLE pcap_metadata DELETE WHERE id = {pcap_id:String}", parameters={'pcap_id': str(old_pcap_id)})
+                get_ch_client().command("ALTER TABLE pcap_project_map DELETE WHERE pcap_id = {pcap_id:String}", parameters={'pcap_id': str(old_pcap_id)})
                 old_file = UPLOAD_DIR / f"{old_pcap_id}.pcap"
                 if old_file.exists():
                     old_file.unlink()
@@ -228,14 +229,24 @@ async def upload_pcap_to_project(project_id: str, background_tasks: BackgroundTa
         saved_filename = f"{file_id}.pcap"
         file_path = UPLOAD_DIR / saved_filename
 
+        # Ensure file is fully written to disk
         with file_path.open("wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
+            buffer.flush()
+            os.fsync(buffer.fileno())
+        
+        # Verify file was written successfully
+        if not file_path.exists() or file_path.stat().st_size == 0:
+            raise HTTPException(status_code=500, detail="Failed to save uploaded file")
+        
+        print(f"[Upload] Saved file {saved_filename}, size: {file_path.stat().st_size} bytes")
 
         # Kick off background ingestion and map to project
         ANALYSIS_PROGRESS[task_id] = {"status": "processing", "progress": 0}
         background_tasks.add_task(parse_and_ingest_pcap_sync, file_path, file_id, file.filename, task_id, ANALYSIS_PROGRESS)
         get_ch_client().command(
-            f"INSERT INTO pcap_project_map (pcap_id, project_id, user_id) VALUES ('{file_id}', '{project_id}', '{current_user['id']}')"
+            "INSERT INTO pcap_project_map (pcap_id, project_id, user_id) VALUES ({pcap_id:String}, {project_id:String}, {user_id:String})",
+            parameters={'pcap_id': str(file_id), 'project_id': project_id, 'user_id': current_user['id']}
         )
         return {"task_id": task_id, "file_id": str(file_id), "replaced": len(existing_files)}
     except HTTPException:
@@ -251,6 +262,15 @@ async def get_analysis_status(task_id: str):
     if progress is None:
         raise HTTPException(status_code=404, detail="Task not found")
     return progress
+
+@app.post("/api/analyze/cancel/{task_id}")
+async def cancel_analysis(task_id: str, current_user: dict = Depends(get_current_user)):
+    """Cancel a running analysis task."""
+    if task_id in ANALYSIS_PROGRESS:
+        ANALYSIS_PROGRESS[task_id]['status'] = 'cancelled'
+        # We can't easily kill the thread, but the thread will check this status
+        return {"message": "Cancellation requested"}
+    raise HTTPException(status_code=404, detail="Task not found")
 
 # --- End Auth & Projects ---
 
@@ -281,8 +301,18 @@ async def upload_pcap(file: UploadFile = File(...)):
         file_id = uuid.uuid4()
         saved_filename = f"{file_id}.pcap"
         file_path = UPLOAD_DIR / saved_filename
+        
+        # Ensure file is fully written to disk
         with file_path.open("wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
+            buffer.flush()
+            os.fsync(buffer.fileno())
+        
+        # Verify file was written successfully
+        if not file_path.exists() or file_path.stat().st_size == 0:
+            raise HTTPException(status_code=500, detail="Failed to save uploaded file")
+        
+        print(f"[Upload] Saved file {saved_filename}, size: {file_path.stat().st_size} bytes")
         # Run ingestion in threadpool
         ingestion_result = await run_in_threadpool(parse_and_ingest_pcap_sync, file_path, file_id, file.filename, str(file_id), ANALYSIS_PROGRESS)
         return {"file_id": str(file_id), "filename": file.filename, "size": ingestion_result["total_bytes"], "path": str(file_path)}
@@ -298,14 +328,14 @@ async def upload_pcap(file: UploadFile = File(...)):
 async def list_pcap_files(current_user: dict = Depends(get_current_user)):
     """List all uploaded PCAP files for the current user across projects."""
     try:
-        query = f"""
+        query = """
         SELECT m.id, m.file_name, m.upload_time, m.total_packets, m.file_size, m.capture_duration
         FROM pcap_project_map map
         INNER JOIN pcap_metadata m ON map.pcap_id = m.id
-        WHERE map.user_id = '{current_user['id']}'
+        WHERE map.user_id = {user_id:String}
         ORDER BY m.upload_time DESC
         """
-        result = get_ch_client().query(query)
+        result = get_ch_client().query(query, parameters={'user_id': current_user['id']})
         files = []
         for row in result.result_rows:
             files.append({
@@ -325,10 +355,10 @@ async def delete_pcap_file(file_id: str, current_user: dict = Depends(get_curren
     """Delete a specific PCAP file's data from ClickHouse and the file itself."""
     try:
         # Delete from packets and dns tables
-        get_ch_client().command(f"ALTER TABLE packets DELETE WHERE pcap_id = '{file_id}'")
-        get_ch_client().command(f"ALTER TABLE dns_log DELETE WHERE pcap_id = '{file_id}'")
+        get_ch_client().command("ALTER TABLE packets DELETE WHERE pcap_id = {pcap_id:String}", parameters={'pcap_id': file_id})
+        get_ch_client().command("ALTER TABLE dns_log DELETE WHERE pcap_id = {pcap_id:String}", parameters={'pcap_id': file_id})
         # Delete from metadata table
-        get_ch_client().command(f"ALTER TABLE pcap_metadata DELETE WHERE id = '{file_id}'")
+        get_ch_client().command("ALTER TABLE pcap_metadata DELETE WHERE id = {pcap_id:String}", parameters={'pcap_id': file_id})
         
         # Delete the actual pcap file from disk (if it still exists)
         file_path = UPLOAD_DIR / f"{file_id}.pcap"
@@ -336,7 +366,7 @@ async def delete_pcap_file(file_id: str, current_user: dict = Depends(get_curren
             file_path.unlink()
 
         # Remove mapping entries
-        get_ch_client().command(f"ALTER TABLE pcap_project_map DELETE WHERE pcap_id = '{file_id}' AND user_id = '{current_user['id']}'")
+        get_ch_client().command("ALTER TABLE pcap_project_map DELETE WHERE pcap_id = {pcap_id:String} AND user_id = {user_id:String}", parameters={'pcap_id': file_id, 'user_id': current_user['id']})
 
         return {"message": f"Data for file {file_id} deleted successfully."}
     except Exception as e:
@@ -347,37 +377,67 @@ async def analyze_pcap(file_id: str, current_user: dict = Depends(get_current_us
     """Analyze PCAP data from ClickHouse and return statistics."""
     try:
         # Get total packets and bytes from metadata
-        metadata_result = get_ch_client().query(f"SELECT total_packets, file_size, capture_duration FROM pcap_metadata WHERE id = '{file_id}'")
+        metadata_result = get_ch_client().query("SELECT total_packets, file_size, capture_duration FROM pcap_metadata WHERE id = {pcap_id:String}", parameters={'pcap_id': file_id})
         if not metadata_result.result_rows:
             raise HTTPException(status_code=404, detail="PCAP metadata not found")
         total_packets, file_size, capture_duration = metadata_result.result_rows[0]
 
         # Protocol distribution
-        protocol_result = get_ch_client().query(f"SELECT protocol, COUNT() FROM packets WHERE pcap_id = '{file_id}' GROUP BY protocol")
+        protocol_result = get_ch_client().query("SELECT protocol, COUNT() FROM packets WHERE pcap_id = {pcap_id:String} GROUP BY protocol", parameters={'pcap_id': file_id})
         protocols = {row[0]: row[1] for row in protocol_result.result_rows}
 
         # Top sources
-        top_src_result = get_ch_client().query(f"SELECT src_ip, COUNT() AS packets, SUM(length) AS bytes FROM packets WHERE pcap_id = '{file_id}' GROUP BY src_ip ORDER BY packets DESC LIMIT 10")
+        top_src_result = get_ch_client().query("SELECT src_ip, COUNT() AS packets, SUM(length) AS bytes FROM packets WHERE pcap_id = {pcap_id:String} GROUP BY src_ip ORDER BY packets DESC LIMIT 10", parameters={'pcap_id': file_id})
         top_sources = []
         for row in top_src_result.result_rows:
             percentage = (row[2] / file_size * 100) if file_size > 0 else 0 # Use file_size here
             top_sources.append({"ip": str(row[0]), "packets": row[1], "bytes": row[2], "percentage": f"{percentage:.2f}%"})
 
         # Top destinations
-        top_dst_result = get_ch_client().query(f"SELECT dst_ip, COUNT() AS packets, SUM(length) AS bytes FROM packets WHERE pcap_id = '{file_id}' GROUP BY dst_ip ORDER BY packets DESC LIMIT 10")
+        top_dst_result = get_ch_client().query("SELECT dst_ip, COUNT() AS packets, SUM(length) AS bytes FROM packets WHERE pcap_id = {pcap_id:String} GROUP BY dst_ip ORDER BY packets DESC LIMIT 10", parameters={'pcap_id': file_id})
         top_destinations = []
         for row in top_dst_result.result_rows:
             percentage = (row[2] / file_size * 100) if file_size > 0 else 0 # Use file_size here
             top_destinations.append({"ip": str(row[0]), "packets": row[1], "bytes": row[2], "percentage": f"{percentage:.2f}%"})
 
-        # Traffic over time (e.g., per second or minute)
-        # For simplicity, let's aggregate per second for now
-        # Use toStartOfInterval with 1 second instead of toStartOfSecond for DateTime compatibility
-        traffic_over_time_result = get_ch_client().query(f"SELECT toStartOfInterval(ts, INTERVAL 1 second) AS time_sec, COUNT() AS packets FROM packets WHERE pcap_id = '{file_id}' GROUP BY time_sec ORDER BY time_sec ASC")
+        # Traffic over time (dynamic interval based on duration)
+        # Target ~500 points for the chart
+        interval_seconds = 1
+        if capture_duration > 0:
+            if capture_duration > 3600 * 24: # > 1 day
+                interval_seconds = 3600 # 1 hour
+            elif capture_duration > 3600: # > 1 hour
+                interval_seconds = 60 # 1 minute
+            elif capture_duration > 600: # > 10 minutes
+                interval_seconds = 10 # 10 seconds
+            
+        traffic_over_time_result = get_ch_client().query(
+            f"SELECT toStartOfInterval(ts, INTERVAL {interval_seconds} second) AS time_sec, COUNT() AS packets FROM packets WHERE pcap_id = {{pcap_id:String}} GROUP BY time_sec ORDER BY time_sec ASC", 
+            parameters={'pcap_id': file_id}
+        )
         traffic_over_time = [{
             "time": row[0].isoformat(),
             "packets": row[1]
         } for row in traffic_over_time_result.result_rows]
+
+        # Traffic by protocol over time (for stacked area chart)
+        traffic_proto_result = get_ch_client().query(
+            f"SELECT toStartOfInterval(ts, INTERVAL {interval_seconds} second) AS time_sec, protocol, COUNT() AS packets FROM packets WHERE pcap_id = {{pcap_id:String}} GROUP BY time_sec, protocol ORDER BY time_sec ASC",
+            parameters={'pcap_id': file_id}
+        )
+        
+        traffic_by_protocol_map = {}
+        for row in traffic_proto_result.result_rows:
+            ts_str = row[0].isoformat()
+            proto = row[1]
+            count = row[2]
+            
+            if ts_str not in traffic_by_protocol_map:
+                traffic_by_protocol_map[ts_str] = {"time": ts_str}
+            
+            traffic_by_protocol_map[ts_str][proto] = count
+            
+        traffic_by_protocol = sorted(traffic_by_protocol_map.values(), key=lambda x: x['time'])
 
         return {
             "file_id": file_id,
@@ -386,6 +446,7 @@ async def analyze_pcap(file_id: str, current_user: dict = Depends(get_current_us
             "top_sources": top_sources,
             "top_destinations": top_destinations,
             "traffic_over_time": traffic_over_time,
+            "traffic_by_protocol": traffic_by_protocol,
             "capture_duration": capture_duration,
             "total_bytes": file_size # Use file_size here
         }
@@ -404,7 +465,8 @@ async def overview(file_id: str, current_user: dict = Depends(get_current_user))
         # Basic metadata
         print(f"Executing meta query for file_id: {file_id}")
         meta = get_ch_client().query(
-            f"SELECT total_packets, file_size, capture_duration FROM pcap_metadata WHERE id = '{file_id}'"
+            "SELECT total_packets, file_size, capture_duration FROM pcap_metadata WHERE id = {pcap_id:String}",
+            parameters={'pcap_id': file_id}
         )
         print(f"Meta query result: {meta.result_rows}")
         if not meta.result_rows:
@@ -414,15 +476,26 @@ async def overview(file_id: str, current_user: dict = Depends(get_current_user))
         # Protocol counts
         print(f"Executing protocols query for file_id: {file_id}")
         protos_q = get_ch_client().query(
-            f"SELECT protocol, COUNT() FROM packets WHERE pcap_id = '{file_id}' GROUP BY protocol"
+            "SELECT protocol, COUNT() FROM packets WHERE pcap_id = {pcap_id:String} GROUP BY protocol",
+            parameters={'pcap_id': file_id}
         )
         print(f"Protocols query result: {protos_q.result_rows}")
         protocols = {r[0]: r[1] for r in protos_q.result_rows}
 
-        # Traffic over time (second resolution)
+        # Traffic over time (dynamic interval)
         print(f"Executing traffic over time query for file_id: {file_id}")
+        interval_seconds = 1
+        if capture_duration > 0:
+            if capture_duration > 3600 * 24: # > 1 day
+                interval_seconds = 3600 # 1 hour
+            elif capture_duration > 3600: # > 1 hour
+                interval_seconds = 60 # 1 minute
+            elif capture_duration > 600: # > 10 minutes
+                interval_seconds = 10 # 10 seconds
+
         traffic_q = get_ch_client().query(
-            f"SELECT toStartOfInterval(ts, INTERVAL 1 second) AS t, COUNT() FROM packets WHERE pcap_id = '{file_id}' GROUP BY t ORDER BY t ASC"
+            f"SELECT toStartOfInterval(ts, INTERVAL {interval_seconds} second) AS t, COUNT() FROM packets WHERE pcap_id = {{pcap_id:String}} GROUP BY t ORDER BY t ASC",
+            parameters={'pcap_id': file_id}
         )
         print(f"Traffic over time query result: {traffic_q.result_rows}")
         traffic = [{"time": r[0].isoformat(), "packets": r[1]} for r in traffic_q.result_rows]
@@ -430,7 +503,8 @@ async def overview(file_id: str, current_user: dict = Depends(get_current_user))
         # Unique hosts
         print(f"Executing unique hosts query for file_id: {file_id}")
         hosts_q = get_ch_client().query(
-            f"SELECT uniq(ip) FROM (SELECT src_ip AS ip FROM packets WHERE pcap_id='{file_id}' UNION ALL SELECT dst_ip AS ip FROM packets WHERE pcap_id='{file_id}')"
+            "SELECT uniq(ip) FROM (SELECT src_ip AS ip FROM packets WHERE pcap_id={pcap_id:String} UNION ALL SELECT dst_ip AS ip FROM packets WHERE pcap_id={pcap_id:String})",
+            parameters={'pcap_id': file_id}
         )
         print(f"Unique hosts query result: {hosts_q.result_rows}")
         unique_hosts = hosts_q.result_rows[0][0] if hosts_q.result_rows else 0
@@ -438,7 +512,8 @@ async def overview(file_id: str, current_user: dict = Depends(get_current_user))
         # Unique connections (src,dst pairs)
         print(f"Executing connections query for file_id: {file_id}")
         conns_q = get_ch_client().query(
-            f"SELECT COUNT() FROM (SELECT src_ip, dst_ip FROM packets WHERE pcap_id='{file_id}' GROUP BY src_ip, dst_ip)"
+            "SELECT COUNT() FROM (SELECT src_ip, dst_ip FROM packets WHERE pcap_id={pcap_id:String} GROUP BY src_ip, dst_ip)",
+            parameters={'pcap_id': file_id}
         )
         print(f"Connections query result: {conns_q.result_rows}")
         connections = conns_q.result_rows[0][0] if conns_q.result_rows else 0
@@ -446,7 +521,8 @@ async def overview(file_id: str, current_user: dict = Depends(get_current_user))
         # Open ports (unique destination ports >0)
         print(f"Executing open ports query for file_id: {file_id}")
         open_ports_q = get_ch_client().query(
-            f"SELECT uniq(dst_port) FROM packets WHERE pcap_id='{file_id}' AND dst_port != 0"
+            "SELECT uniq(dst_port) FROM packets WHERE pcap_id={pcap_id:String} AND dst_port != 0",
+            parameters={'pcap_id': file_id}
         )
         print(f"Open ports query result: {open_ports_q.result_rows}")
         open_ports = open_ports_q.result_rows[0][0] if open_ports_q.result_rows else 0
@@ -454,7 +530,8 @@ async def overview(file_id: str, current_user: dict = Depends(get_current_user))
         # Top destination IPs (heuristic servers)
         print(f"Executing top servers query for file_id: {file_id}")
         servers_q = get_ch_client().query(
-            f"SELECT dst_ip, COUNT() AS c, SUM(length) AS b FROM packets WHERE pcap_id='{file_id}' GROUP BY dst_ip ORDER BY c DESC LIMIT 10"
+            "SELECT dst_ip, COUNT() AS c, SUM(length) AS b FROM packets WHERE pcap_id={pcap_id:String} GROUP BY dst_ip ORDER BY c DESC LIMIT 10",
+            parameters={'pcap_id': file_id}
         )
         print(f"Top servers query result: {servers_q.result_rows}")
         top_servers = [{"ip": str(r[0]), "packets": r[1], "bytes": r[2]} for r in servers_q.result_rows if str(r[0]) != '0.0.0.0']
@@ -462,13 +539,14 @@ async def overview(file_id: str, current_user: dict = Depends(get_current_user))
         # Top destination ports overall
         print(f"Executing top ports query for file_id: {file_id}")
         top_ports_q = get_ch_client().query(
-            f"SELECT dst_port, COUNT() AS c FROM packets WHERE pcap_id='{file_id}' AND dst_port != 0 GROUP BY dst_port ORDER BY c DESC LIMIT 10"
+            "SELECT dst_port, COUNT() AS c FROM packets WHERE pcap_id={pcap_id:String} AND dst_port != 0 GROUP BY dst_port ORDER BY c DESC LIMIT 10",
+            parameters={'pcap_id': file_id}
         )
         print(f"Top ports query result: {top_ports_q.result_rows}")
         top_ports = [{"port": int(r[0]), "count": r[1]} for r in top_ports_q.result_rows]
 
         categories = {
-            "dns": protocols.get("DNS", 0),
+            "dns": protocols.get("DNS", 0) + protocols.get("mDNS", 0) + protocols.get("LLMNR", 0) + protocols.get("NBNS", 0),
             "http": protocols.get("HTTP", 0),
             "ssl": protocols.get("TLS", 0),
             "quic": protocols.get("QUIC", 0),
@@ -478,6 +556,10 @@ async def overview(file_id: str, current_user: dict = Depends(get_current_user))
             "ftp": protocols.get("FTP", 0),
             "ssdp": protocols.get("SSDP", 0),
             "sip": protocols.get("SIP", 0),
+            "dhcp": protocols.get("DHCP", 0),
+            "icmp": protocols.get("ICMP", 0),
+            "tcp": protocols.get("TCP", 0),
+            "udp": protocols.get("UDP", 0),
             "open_ports": open_ports,
             "connections": connections,
             "hosts": unique_hosts,
@@ -515,10 +597,10 @@ async def get_packets(file_id: str, limit: int = 1000, offset: int = 0, current_
 SELECT 
     ts, pcap_id, packet_number, src_ip, dst_ip, src_port, dst_port, protocol, length, file_offset, info 
     FROM packets 
-    WHERE pcap_id = '{file_id}' 
+    WHERE pcap_id = {{pcap_id:String}} 
     ORDER BY ts ASC, packet_number ASC 
-    LIMIT {limit} OFFSET {offset}"""
-        result = ch_client.query(query)
+    LIMIT {{limit:UInt32}} OFFSET {{offset:UInt32}}"""
+        result = ch_client.query(query, parameters={'pcap_id': file_id, 'limit': limit, 'offset': offset})
         
         packets = []
         for row in result.result_rows:
@@ -537,7 +619,7 @@ SELECT
             })
         
         # Get total count for pagination metadata
-        total_count_result = ch_client.query(f"SELECT COUNT() FROM packets WHERE pcap_id = '{file_id}'")
+        total_count_result = ch_client.query("SELECT COUNT() FROM packets WHERE pcap_id = {pcap_id:String}", parameters={'pcap_id': file_id})
         total_count = total_count_result.result_rows[0][0]
 
         return {
@@ -554,12 +636,12 @@ SELECT
 async def get_packet_detail(file_id: str, packet_number: int, current_user: dict = Depends(get_current_user)):
     """Get full details for a single packet from ClickHouse."""
     try:
-        query = f"""
+        query = """
 SELECT 
     ts, pcap_id, packet_number, src_ip, dst_ip, src_port, dst_port, protocol, length, file_offset, info, layers_json 
     FROM packets 
-    WHERE pcap_id = '{file_id}' AND packet_number = {packet_number}"""
-        result = ch_client.query(query)
+    WHERE pcap_id = {pcap_id:String} AND packet_number = {packet_number:UInt32}"""
+        result = ch_client.query(query, parameters={'pcap_id': file_id, 'packet_number': packet_number})
         
         if not result.result_rows:
             raise HTTPException(status_code=404, detail=f"Packet {packet_number} not found for file {file_id}")
@@ -605,12 +687,12 @@ def get_conversations_from_clickhouse(file_id: str):
     """Get network conversations for graph visualization from ClickHouse."""
     try:
         # Aggregate conversations
-        conversation_result = ch_client.query(f"""
+        conversation_result = ch_client.query("""
 SELECT 
     src_ip, dst_ip, COUNT() AS packets, SUM(length) AS bytes
 FROM packets 
-WHERE pcap_id = '{file_id}' 
-GROUP BY src_ip, dst_ip""")
+WHERE pcap_id = {pcap_id:String} 
+GROUP BY src_ip, dst_ip""", parameters={'pcap_id': file_id})
         
         nodes = []
         edges = []
@@ -668,10 +750,12 @@ async def get_node_summary(file_id: str, ip: str, current_user: dict = Depends(g
     try:
         # Total inbound/outbound packets
         inbound = ch_client.query(
-            f"SELECT COUNT(), SUM(length) FROM packets WHERE pcap_id = '{file_id}' AND dst_ip = '{ip}'"
+            "SELECT COUNT(), SUM(length) FROM packets WHERE pcap_id = {pcap_id:String} AND dst_ip = {ip:String}",
+            parameters={'pcap_id': file_id, 'ip': ip}
         ).result_rows
         outbound = ch_client.query(
-            f"SELECT COUNT(), SUM(length) FROM packets WHERE pcap_id = '{file_id}' AND src_ip = '{ip}'"
+            "SELECT COUNT(), SUM(length) FROM packets WHERE pcap_id = {pcap_id:String} AND src_ip = {ip:String}",
+            parameters={'pcap_id': file_id, 'ip': ip}
         ).result_rows
 
         inbound_packets, inbound_bytes = (inbound[0][0], inbound[0][1] or 0) if inbound else (0, 0)
@@ -679,26 +763,29 @@ async def get_node_summary(file_id: str, ip: str, current_user: dict = Depends(g
 
         # Top protocols across both directions
         protos = ch_client.query(
-            f"""
+            """
             SELECT protocol, COUNT() AS c
             FROM packets
-            WHERE pcap_id = '{file_id}' AND (src_ip = '{ip}' OR dst_ip = '{ip}')
+            WHERE pcap_id = {pcap_id:String} AND (src_ip = {ip:String} OR dst_ip = {ip:String})
             GROUP BY protocol
             ORDER BY c DESC
             LIMIT 5
-            """
+            """,
+            parameters={'pcap_id': file_id, 'ip': ip}
         )
         top_protocols = [{"protocol": r[0], "count": r[1]} for r in protos.result_rows]
 
         # Top destination ports for outbound traffic
         top_dst_ports_q = ch_client.query(
-            f"SELECT dst_port, COUNT() AS c FROM packets WHERE pcap_id = '{file_id}' AND src_ip = '{ip}' AND dst_port != 0 GROUP BY dst_port ORDER BY c DESC LIMIT 5"
+            "SELECT dst_port, COUNT() AS c FROM packets WHERE pcap_id = {pcap_id:String} AND src_ip = {ip:String} AND dst_port != 0 GROUP BY dst_port ORDER BY c DESC LIMIT 5",
+            parameters={'pcap_id': file_id, 'ip': ip}
         )
         top_dst_ports = [{"port": int(r[0]), "count": r[1]} for r in top_dst_ports_q.result_rows]
 
         # Top source ports for inbound traffic
         top_src_ports_q = ch_client.query(
-            f"SELECT src_port, COUNT() AS c FROM packets WHERE pcap_id = '{file_id}' AND dst_ip = '{ip}' AND src_port != 0 GROUP BY src_port ORDER BY c DESC LIMIT 5"
+            "SELECT src_port, COUNT() AS c FROM packets WHERE pcap_id = {pcap_id:String} AND dst_ip = {ip:String} AND src_port != 0 GROUP BY src_port ORDER BY c DESC LIMIT 5",
+            parameters={'pcap_id': file_id, 'ip': ip}
         )
         top_src_ports = [{"port": int(r[0]), "count": r[1]} for r in top_src_ports_q.result_rows]
         
@@ -742,7 +829,7 @@ async def get_geomap_data(file_id: str, current_user: dict = Depends(get_current
     
     try:
         # Get unique IPs with packet/byte counts
-        query = f"""
+        query = """
         SELECT 
             ip,
             SUM(packets) AS total_packets,
@@ -750,14 +837,14 @@ async def get_geomap_data(file_id: str, current_user: dict = Depends(get_current
         FROM (
             SELECT src_ip AS ip, COUNT() AS packets, SUM(length) AS bytes
             FROM packets
-            WHERE pcap_id = '{file_id}' AND src_ip != '0.0.0.0'
+            WHERE pcap_id = {pcap_id:String} AND src_ip != '0.0.0.0'
             GROUP BY src_ip
             
             UNION ALL
             
             SELECT dst_ip AS ip, COUNT() AS packets, SUM(length) AS bytes
             FROM packets
-            WHERE pcap_id = '{file_id}' AND dst_ip != '0.0.0.0'
+            WHERE pcap_id = {pcap_id:String} AND dst_ip != '0.0.0.0'
             GROUP BY dst_ip
         )
         GROUP BY ip
@@ -765,7 +852,7 @@ async def get_geomap_data(file_id: str, current_user: dict = Depends(get_current
         LIMIT 100
         """
         
-        result = ch_client.query(query)
+        result = ch_client.query(query, parameters={'pcap_id': file_id})
         
         locations = []
         for row in result.result_rows:
@@ -977,6 +1064,11 @@ async def dns_aggregates(
         unique_domains_sql = f"SELECT uniq(query) FROM dns_log WHERE {where_sql}"
         unique_domains = ch_client.query(unique_domains_sql).result_rows[0][0]
 
+        # Error Rate (NXDOMAIN / Total)
+        nxdomain_sql = f"SELECT COUNT() FROM dns_log WHERE {where_sql} AND rcode_name = 'NXDOMAIN'"
+        nxdomain_count = ch_client.query(nxdomain_sql).result_rows[0][0]
+        error_rate = (nxdomain_count / total * 100) if total > 0 else 0
+
         qtypes_sql = f"SELECT qtype_name, COUNT() FROM dns_log WHERE {where_sql} GROUP BY qtype_name"
         qtype_rows = ch_client.query(qtypes_sql).result_rows
         qtype_map = {r[0]: r[1] for r in qtype_rows if r[0]}
@@ -996,12 +1088,40 @@ async def dns_aggregates(
         top_rows = ch_client.query(top_domains_sql).result_rows
         top_domains = [{"domain": r[0], "count": r[1]} for r in top_rows if r[0]]
 
+        # QPS Over Time (dynamic interval)
+        # First get time range to determine interval
+        range_sql = f"SELECT min(ts), max(ts) FROM dns_log WHERE {where_sql}"
+        range_res = ch_client.query(range_sql).result_rows
+        
+        interval_seconds = 1
+        if range_res and range_res[0][0] and range_res[0][1]:
+            start_ts, end_ts = range_res[0]
+            duration = (end_ts - start_ts).total_seconds()
+            if duration > 3600 * 24:
+                interval_seconds = 3600
+            elif duration > 3600:
+                interval_seconds = 60
+            elif duration > 600:
+                interval_seconds = 10
+
+        qps_sql = f"""
+        SELECT toStartOfInterval(ts, INTERVAL {interval_seconds} second) AS t, COUNT() 
+        FROM dns_log 
+        WHERE {where_sql} 
+        GROUP BY t 
+        ORDER BY t ASC
+        """
+        qps_rows = ch_client.query(qps_sql).result_rows
+        qps_data = [{"time": r[0].isoformat(), "count": r[1]} for r in qps_rows]
+
         return {
             "total": total,
             "unique_domains": unique_domains,
+            "error_rate": error_rate,
             "query_types": qtype_map,
             "rcodes": rcode_map,
             "top_domains": top_domains,
+            "qps_data": qps_data,
             "filters_applied": {
                 "search": search or None,
                 "qtype": qtype.split(',') if qtype else [],
@@ -1011,6 +1131,68 @@ async def dns_aggregates(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to compute DNS aggregates: {e}")
 
+@app.get("/api/dns/{file_id}/security")
+async def dns_security(file_id: str, current_user: dict = Depends(get_current_user)):
+    """Security analysis for DNS traffic."""
+    try:
+        # 1. Potential DGA (High Entropy / Long Random-looking domains)
+        # Heuristic: Length > 15 and NXDOMAIN or just long queries
+        dga_sql = f"""
+        SELECT query, length(query) as len, COUNT() as c
+        FROM dns_log
+        WHERE pcap_id = '{file_id}' AND length(query) > 15 AND rcode_name = 'NXDOMAIN'
+        GROUP BY query
+        ORDER BY len DESC, c DESC
+        LIMIT 20
+        """
+        dga_rows = ch_client.query(dga_sql).result_rows
+        dga_candidates = [{"domain": r[0], "length": r[1], "count": r[2], "reason": "Long NXDOMAIN"} for r in dga_rows]
+
+        # 2. Potential Tunneling (Very long queries or TXT records with large responses)
+        # Note: We don't have response size in dns_log yet, so we rely on query length
+        tunnel_sql = f"""
+        SELECT query, length(query) as len, qtype_name, COUNT() as c
+        FROM dns_log
+        WHERE pcap_id = '{file_id}' AND length(query) > 50
+        GROUP BY query, qtype_name
+        ORDER BY len DESC
+        LIMIT 20
+        """
+        tunnel_rows = ch_client.query(tunnel_sql).result_rows
+        tunnel_candidates = [{"domain": r[0], "length": r[1], "type": r[2], "count": r[3], "reason": "Excessive Length"} for r in tunnel_rows]
+
+        # 3. Top Talkers (Clients)
+        clients_sql = f"""
+        SELECT id_orig_h, COUNT() as c, uniq(query) as unique_queries
+        FROM dns_log
+        WHERE pcap_id = '{file_id}'
+        GROUP BY id_orig_h
+        ORDER BY c DESC
+        LIMIT 10
+        """
+        clients_rows = ch_client.query(clients_sql).result_rows
+        top_clients = [{"ip": r[0], "count": r[1], "unique_queries": r[2]} for r in clients_rows]
+
+        # 4. Rare Domains (Seen only once)
+        rare_sql = f"""
+        SELECT query, qtype_name
+        FROM dns_log
+        WHERE pcap_id = '{file_id}'
+        GROUP BY query, qtype_name
+        HAVING COUNT() = 1
+        LIMIT 20
+        """
+        rare_rows = ch_client.query(rare_sql).result_rows
+        rare_domains = [{"domain": r[0], "type": r[1]} for r in rare_rows]
+
+        return {
+            "dga_candidates": dga_candidates,
+            "tunneling_candidates": tunnel_candidates,
+            "top_clients": top_clients,
+            "rare_domains": rare_domains
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to compute DNS security metrics: {e}")
 
 @app.get("/api/details/http/{file_id}")
 async def get_http_details(file_id: str, current_user: dict = Depends(get_current_user)):
@@ -1359,6 +1541,51 @@ async def get_smb_details(file_id: str, current_user: dict = Depends(get_current
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get SMB details: {e}")
+
+
+@app.get("/api/details/generic/{file_id}")
+async def get_generic_protocol_details(file_id: str, protocol: str, current_user: dict = Depends(get_current_user)):
+    """Get generic packet details for a specific protocol."""
+    try:
+        # Sanitize protocol to prevent injection (though ClickHouse parameters handle this)
+        # We allow comma separated protocols for grouping
+        protocols = [p.strip() for p in protocol.split(',')]
+        
+        if not protocols:
+             raise HTTPException(status_code=400, detail="Protocol required")
+
+        # Build IN clause
+        proto_list = "', '".join(protocols)
+        
+        query = f"""
+        SELECT 
+            ts, src_ip, dst_ip, src_port, dst_port, info, length
+        FROM packets 
+        WHERE pcap_id = '{file_id}' AND protocol IN ('{proto_list}')
+        ORDER BY ts DESC
+        LIMIT 500
+        """
+        result = ch_client.query(query)
+        
+        packets = []
+        for row in result.result_rows:
+            ts, src_ip, dst_ip, src_port, dst_port, info, length = row
+            
+            packets.append({
+                "time": ts.isoformat(),
+                "source": f"{src_ip}:{src_port}" if src_port else src_ip,
+                "destination": f"{dst_ip}:{dst_port}" if dst_port else dst_ip,
+                "info": info,
+                "length": length
+            })
+        
+        return {
+            "protocol": protocol,
+            "total": len(packets),
+            "packets": packets
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get generic details: {e}")
 
 
 if __name__ == "__main__":

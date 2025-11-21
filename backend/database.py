@@ -14,7 +14,7 @@ def _attempt_connect():
         database=CH_DATABASE,
     )
 
-def get_ch_client():
+def get_ch_client(database=CH_DATABASE):
     """Return a cached ClickHouse client, connecting on first use.
     Raises HTTPException(500) if connection cannot be established.
     """
@@ -22,9 +22,41 @@ def get_ch_client():
     if _ch_client is not None:
         return _ch_client
     try:
-        _ch_client = _attempt_connect()
+        # Try connecting to the specified database
+        try:
+            _ch_client = clickhouse_connect.get_client(
+                host=CH_HOST,
+                port=CH_PORT,
+                username=CH_USER,
+                password=CH_PASSWORD,
+                database=database,
+            )
+        except Exception as e:
+            # If database doesn't exist, connect to default to create it
+            if "UNKNOWN_DATABASE" in str(e) or "does not exist" in str(e):
+                print(f"[ClickHouse] Database {database} not found, connecting to default...")
+                temp_client = clickhouse_connect.get_client(
+                    host=CH_HOST,
+                    port=CH_PORT,
+                    username=CH_USER,
+                    password=CH_PASSWORD,
+                    database="default",
+                )
+                temp_client.command(f"CREATE DATABASE IF NOT EXISTS {database}")
+                print(f"[ClickHouse] Created database {database}")
+                # Now connect to the new database
+                _ch_client = clickhouse_connect.get_client(
+                    host=CH_HOST,
+                    port=CH_PORT,
+                    username=CH_USER,
+                    password=CH_PASSWORD,
+                    database=database,
+                )
+            else:
+                raise e
+
         _ch_client.ping()
-        print(f"[ClickHouse] Connected -> {CH_HOST}:{CH_PORT} / DB={CH_DATABASE}")
+        print(f"[ClickHouse] Connected -> {CH_HOST}:{CH_PORT} / DB={database}")
         return _ch_client
     except Exception as e:
         print(f"[ClickHouse] Initial connect failed: {e}")
@@ -37,7 +69,7 @@ def wait_for_clickhouse(max_seconds: int = 30, interval: float = 2.0) -> bool:
     while time.time() < deadline:
         attempt += 1
         try:
-            client = _attempt_connect()
+            client = get_ch_client()
             client.ping()
             print(f"[ClickHouse] Ready after {attempt} attempt(s)")
             global _ch_client

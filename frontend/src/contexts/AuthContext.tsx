@@ -91,9 +91,11 @@ export const authFetch = async (url: string, options: RequestInit = {}) => {
   };
   const res = await fetch(url, { ...options, headers });
   if (res.status === 401) {
-    // Token expired or invalid; let the calling function handle it
-    // For now, we'll just return the response and let the caller decide.
-    // In a real app, you might want to trigger a token refresh flow here.
+    // Token expired or invalid - clear auth state and force re-login
+    localStorage.removeItem('token');
+    localStorage.removeItem('projectId');
+    // Trigger a page reload to redirect to login screen
+    window.location.reload();
   }
   return res;
 };
