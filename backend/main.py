@@ -896,15 +896,15 @@ async def get_dns_details(file_id: str, current_user: dict = Depends(get_current
     """Get detailed DNS query information."""
     try:
         # Backward-compatible basic DNS details (will be superseded by /api/dns/... endpoints)
-        base_query = f"""
+        base_query = """
         SELECT 
             ts, id_orig_h, id_resp_h, query, qtype_name, rcode_name, answers, AA, TC, RD, RA, TTLs
         FROM dns_log 
-        WHERE pcap_id = '{file_id}'
+        WHERE pcap_id = {file_id:String}
         ORDER BY ts DESC
         LIMIT 300
         """
-        result = ch_client.query(base_query)
+        result = ch_client.query(base_query, parameters={'file_id': file_id})
 
         dns_queries = []
         query_types: Dict[str, int] = {}
@@ -968,19 +968,27 @@ async def dns_records(
     try:
         limit = max(1, min(limit, 500))
         # Build WHERE clauses
-        where_clauses = [f"pcap_id = '{file_id}'"]
+        where_clauses = ["pcap_id = {file_id:String}"]
+        parameters = {'file_id': file_id}
+
         if search:
-            where_clauses.append(f"lower(query) LIKE '%{search.lower()}%'")
+            # Note: Parameterized LIKE needs careful handling or using position() or similar
+            # ClickHouse supports ilike or position(lower(str), lower(substr)) > 0
+            where_clauses.append("position(lower(query), {search:String}) > 0")
+            parameters['search'] = search.lower()
+
         if qtype:
             qtypes = [qt.strip() for qt in qtype.split(',') if qt.strip()]
             if qtypes:
-                in_list = ",".join([f"'{qt}'" for qt in qtypes])
-                where_clauses.append(f"qtype_name IN ({in_list})")
+                # ClickHouse parameter arrays for IN clause
+                where_clauses.append("qtype_name IN {qtypes:Array(String)}")
+                parameters['qtypes'] = qtypes
+
         if rcode:
             rcodes_list = [rc.strip() for rc in rcode.split(',') if rc.strip()]
             if rcodes_list:
-                in_list = ",".join([f"'{rc}'" for rc in rcodes_list])
-                where_clauses.append(f"rcode_name IN ({in_list})")
+                where_clauses.append("rcode_name IN {rcodes:Array(String)}")
+                parameters['rcodes'] = rcodes_list
 
         where_sql = " AND ".join(where_clauses)
 
@@ -990,6 +998,10 @@ async def dns_records(
             "domain_asc": "query ASC",
             "domain_desc": "query DESC"
         }
+        # Validate sort parameter to prevent injection
+        if sort not in sort_map:
+            sort = "time_desc"
+
         order_clause = sort_map.get(sort, "ts DESC")
 
         base_sql = f"""
@@ -997,13 +1009,16 @@ async def dns_records(
         FROM dns_log
         WHERE {where_sql}
         ORDER BY {order_clause}
-        LIMIT {limit} OFFSET {offset}
+        LIMIT {{limit:UInt32}} OFFSET {{offset:UInt32}}
         """
-        rows = ch_client.query(base_sql).result_rows
+        parameters['limit'] = limit
+        parameters['offset'] = offset
+
+        rows = ch_client.query(base_sql, parameters=parameters).result_rows
 
         # Total count for pagination
         count_sql = f"SELECT COUNT() FROM dns_log WHERE {where_sql}"
-        total_count = ch_client.query(count_sql).result_rows[0][0]
+        total_count = ch_client.query(count_sql, parameters=parameters).result_rows[0][0]
 
         records = []
         for r in rows:
@@ -1043,38 +1058,42 @@ async def dns_aggregates(
     """Aggregated DNS statistics supporting filters matching /records."""
     try:
         # Reuse filter building logic
-        where_clauses = [f"pcap_id = '{file_id}'"]
+        where_clauses = ["pcap_id = {file_id:String}"]
+        parameters = {'file_id': file_id}
+
         if search:
-            where_clauses.append(f"lower(query) LIKE '%{search.lower()}%'")
+            where_clauses.append("position(lower(query), {search:String}) > 0")
+            parameters['search'] = search.lower()
         if qtype:
             qtypes = [qt.strip() for qt in qtype.split(',') if qt.strip()]
             if qtypes:
-                in_list = ",".join([f"'{qt}'" for qt in qtypes])
-                where_clauses.append(f"qtype_name IN ({in_list})")
+                where_clauses.append("qtype_name IN {qtypes:Array(String)}")
+                parameters['qtypes'] = qtypes
         if rcode:
             rcodes_list = [rc.strip() for rc in rcode.split(',') if rc.strip()]
             if rcodes_list:
-                in_list = ",".join([f"'{rc}'" for rc in rcodes_list])
-                where_clauses.append(f"rcode_name IN ({in_list})")
+                where_clauses.append("rcode_name IN {rcodes:Array(String)}")
+                parameters['rcodes'] = rcodes_list
+
         where_sql = " AND ".join(where_clauses)
 
         total_sql = f"SELECT COUNT() FROM dns_log WHERE {where_sql}"
-        total = ch_client.query(total_sql).result_rows[0][0]
+        total = ch_client.query(total_sql, parameters=parameters).result_rows[0][0]
 
         unique_domains_sql = f"SELECT uniq(query) FROM dns_log WHERE {where_sql}"
-        unique_domains = ch_client.query(unique_domains_sql).result_rows[0][0]
+        unique_domains = ch_client.query(unique_domains_sql, parameters=parameters).result_rows[0][0]
 
         # Error Rate (NXDOMAIN / Total)
         nxdomain_sql = f"SELECT COUNT() FROM dns_log WHERE {where_sql} AND rcode_name = 'NXDOMAIN'"
-        nxdomain_count = ch_client.query(nxdomain_sql).result_rows[0][0]
+        nxdomain_count = ch_client.query(nxdomain_sql, parameters=parameters).result_rows[0][0]
         error_rate = (nxdomain_count / total * 100) if total > 0 else 0
 
         qtypes_sql = f"SELECT qtype_name, COUNT() FROM dns_log WHERE {where_sql} GROUP BY qtype_name"
-        qtype_rows = ch_client.query(qtypes_sql).result_rows
+        qtype_rows = ch_client.query(qtypes_sql, parameters=parameters).result_rows
         qtype_map = {r[0]: r[1] for r in qtype_rows if r[0]}
 
         rcodes_sql = f"SELECT rcode_name, COUNT() FROM dns_log WHERE {where_sql} GROUP BY rcode_name"
-        rcode_rows = ch_client.query(rcodes_sql).result_rows
+        rcode_rows = ch_client.query(rcodes_sql, parameters=parameters).result_rows
         rcode_map = {r[0]: r[1] for r in rcode_rows if r[0]}
 
         top_domains_sql = f"""
@@ -1083,15 +1102,16 @@ async def dns_aggregates(
         WHERE {where_sql}
         GROUP BY query
         ORDER BY c DESC
-        LIMIT {top_limit}
+        LIMIT {{top_limit:UInt32}}
         """
-        top_rows = ch_client.query(top_domains_sql).result_rows
+        parameters['top_limit'] = top_limit
+        top_rows = ch_client.query(top_domains_sql, parameters=parameters).result_rows
         top_domains = [{"domain": r[0], "count": r[1]} for r in top_rows if r[0]]
 
         # QPS Over Time (dynamic interval)
         # First get time range to determine interval
         range_sql = f"SELECT min(ts), max(ts) FROM dns_log WHERE {where_sql}"
-        range_res = ch_client.query(range_sql).result_rows
+        range_res = ch_client.query(range_sql, parameters=parameters).result_rows
         
         interval_seconds = 1
         if range_res and range_res[0][0] and range_res[0][1]:
@@ -1111,7 +1131,7 @@ async def dns_aggregates(
         GROUP BY t 
         ORDER BY t ASC
         """
-        qps_rows = ch_client.query(qps_sql).result_rows
+        qps_rows = ch_client.query(qps_sql, parameters=parameters).result_rows
         qps_data = [{"time": r[0].isoformat(), "count": r[1]} for r in qps_rows]
 
         return {
@@ -1135,54 +1155,55 @@ async def dns_aggregates(
 async def dns_security(file_id: str, current_user: dict = Depends(get_current_user)):
     """Security analysis for DNS traffic."""
     try:
+        parameters = {'file_id': file_id}
         # 1. Potential DGA (High Entropy / Long Random-looking domains)
         # Heuristic: Length > 15 and NXDOMAIN or just long queries
-        dga_sql = f"""
+        dga_sql = """
         SELECT query, length(query) as len, COUNT() as c
         FROM dns_log
-        WHERE pcap_id = '{file_id}' AND length(query) > 15 AND rcode_name = 'NXDOMAIN'
+        WHERE pcap_id = {file_id:String} AND length(query) > 15 AND rcode_name = 'NXDOMAIN'
         GROUP BY query
         ORDER BY len DESC, c DESC
         LIMIT 20
         """
-        dga_rows = ch_client.query(dga_sql).result_rows
+        dga_rows = ch_client.query(dga_sql, parameters=parameters).result_rows
         dga_candidates = [{"domain": r[0], "length": r[1], "count": r[2], "reason": "Long NXDOMAIN"} for r in dga_rows]
 
         # 2. Potential Tunneling (Very long queries or TXT records with large responses)
         # Note: We don't have response size in dns_log yet, so we rely on query length
-        tunnel_sql = f"""
+        tunnel_sql = """
         SELECT query, length(query) as len, qtype_name, COUNT() as c
         FROM dns_log
-        WHERE pcap_id = '{file_id}' AND length(query) > 50
+        WHERE pcap_id = {file_id:String} AND length(query) > 50
         GROUP BY query, qtype_name
         ORDER BY len DESC
         LIMIT 20
         """
-        tunnel_rows = ch_client.query(tunnel_sql).result_rows
+        tunnel_rows = ch_client.query(tunnel_sql, parameters=parameters).result_rows
         tunnel_candidates = [{"domain": r[0], "length": r[1], "type": r[2], "count": r[3], "reason": "Excessive Length"} for r in tunnel_rows]
 
         # 3. Top Talkers (Clients)
-        clients_sql = f"""
+        clients_sql = """
         SELECT id_orig_h, COUNT() as c, uniq(query) as unique_queries
         FROM dns_log
-        WHERE pcap_id = '{file_id}'
+        WHERE pcap_id = {file_id:String}
         GROUP BY id_orig_h
         ORDER BY c DESC
         LIMIT 10
         """
-        clients_rows = ch_client.query(clients_sql).result_rows
+        clients_rows = ch_client.query(clients_sql, parameters=parameters).result_rows
         top_clients = [{"ip": r[0], "count": r[1], "unique_queries": r[2]} for r in clients_rows]
 
         # 4. Rare Domains (Seen only once)
-        rare_sql = f"""
+        rare_sql = """
         SELECT query, qtype_name
         FROM dns_log
-        WHERE pcap_id = '{file_id}'
+        WHERE pcap_id = {file_id:String}
         GROUP BY query, qtype_name
         HAVING COUNT() = 1
         LIMIT 20
         """
-        rare_rows = ch_client.query(rare_sql).result_rows
+        rare_rows = ch_client.query(rare_sql, parameters=parameters).result_rows
         rare_domains = [{"domain": r[0], "type": r[1]} for r in rare_rows]
 
         return {
@@ -1198,15 +1219,15 @@ async def dns_security(file_id: str, current_user: dict = Depends(get_current_us
 async def get_http_details(file_id: str, current_user: dict = Depends(get_current_user)):
     """Get detailed HTTP request/response information."""
     try:
-        query = f"""
+        query = """
         SELECT 
             ts, src_ip, dst_ip, src_port, dst_port, info, layers_json
         FROM packets 
-        WHERE pcap_id = '{file_id}' AND protocol = 'HTTP'
+        WHERE pcap_id = {file_id:String} AND protocol = 'HTTP'
         ORDER BY ts DESC
         LIMIT 500
         """
-        result = ch_client.query(query)
+        result = ch_client.query(query, parameters={'file_id': file_id})
         
         http_requests = []
         methods = {}
@@ -1279,15 +1300,15 @@ async def get_http_details(file_id: str, current_user: dict = Depends(get_curren
 async def get_tls_details(file_id: str, current_user: dict = Depends(get_current_user)):
     """Get detailed TLS/SSL session information."""
     try:
-        query = f"""
+        query = """
         SELECT 
             ts, src_ip, dst_ip, src_port, dst_port, info, layers_json
         FROM packets 
-        WHERE pcap_id = '{file_id}' AND protocol = 'TLS'
+        WHERE pcap_id = {file_id:String} AND protocol = 'TLS'
         ORDER BY ts DESC
         LIMIT 500
         """
-        result = ch_client.query(query)
+        result = ch_client.query(query, parameters={'file_id': file_id})
         
         tls_sessions = []
         tls_versions = {}
@@ -1349,7 +1370,7 @@ async def get_tls_details(file_id: str, current_user: dict = Depends(get_current
 async def get_open_ports_details(file_id: str, current_user: dict = Depends(get_current_user)):
     """Get detailed open ports information."""
     try:
-        query = f"""
+        query = """
         SELECT 
             dst_port, 
             protocol,
@@ -1358,12 +1379,12 @@ async def get_open_ports_details(file_id: str, current_user: dict = Depends(get_
             uniq(dst_ip) AS unique_destinations,
             SUM(length) AS total_bytes
         FROM packets 
-        WHERE pcap_id = '{file_id}' AND dst_port != 0
+        WHERE pcap_id = {file_id:String} AND dst_port != 0
         GROUP BY dst_port, protocol
         ORDER BY connections DESC
         LIMIT 100
         """
-        result = ch_client.query(query)
+        result = ch_client.query(query, parameters={'file_id': file_id})
         
         ports_data = []
         port_services = {
@@ -1398,7 +1419,7 @@ async def get_open_ports_details(file_id: str, current_user: dict = Depends(get_
 async def get_connections_details(file_id: str, current_user: dict = Depends(get_current_user)):
     """Get detailed connection information."""
     try:
-        query = f"""
+        query = """
         SELECT 
             src_ip, dst_ip, protocol,
             COUNT() AS packets,
@@ -1406,12 +1427,12 @@ async def get_connections_details(file_id: str, current_user: dict = Depends(get
             min(ts) AS first_seen,
             max(ts) AS last_seen
         FROM packets 
-        WHERE pcap_id = '{file_id}'
+        WHERE pcap_id = {file_id:String}
         GROUP BY src_ip, dst_ip, protocol
         ORDER BY packets DESC
         LIMIT 200
         """
-        result = ch_client.query(query)
+        result = ch_client.query(query, parameters={'file_id': file_id})
         
         connections = []
         for row in result.result_rows:
@@ -1441,15 +1462,15 @@ async def get_connections_details(file_id: str, current_user: dict = Depends(get
 async def get_arp_details(file_id: str, current_user: dict = Depends(get_current_user)):
     """Get detailed ARP information."""
     try:
-        query = f"""
+        query = """
         SELECT 
             ts, src_ip, dst_ip, info, layers_json
         FROM packets 
-        WHERE pcap_id = '{file_id}' AND protocol = 'ARP'
+        WHERE pcap_id = {file_id:String} AND protocol = 'ARP'
         ORDER BY ts DESC
         LIMIT 500
         """
-        result = ch_client.query(query)
+        result = ch_client.query(query, parameters={'file_id': file_id})
         
         arp_packets = []
         ip_mac_map = {}
@@ -1514,15 +1535,15 @@ async def get_arp_details(file_id: str, current_user: dict = Depends(get_current
 async def get_smb_details(file_id: str, current_user: dict = Depends(get_current_user)):
     """Get detailed SMB information."""
     try:
-        query = f"""
+        query = """
         SELECT 
             ts, src_ip, dst_ip, src_port, dst_port, info
         FROM packets 
-        WHERE pcap_id = '{file_id}' AND (protocol = 'SMB' OR protocol = 'NBNS')
+        WHERE pcap_id = {file_id:String} AND (protocol = 'SMB' OR protocol = 'NBNS')
         ORDER BY ts DESC
         LIMIT 500
         """
-        result = ch_client.query(query)
+        result = ch_client.query(query, parameters={'file_id': file_id})
         
         smb_activity = []
         for row in result.result_rows:
@@ -1555,17 +1576,17 @@ async def get_generic_protocol_details(file_id: str, protocol: str, current_user
              raise HTTPException(status_code=400, detail="Protocol required")
 
         # Build IN clause
-        proto_list = "', '".join(protocols)
+        # ClickHouse driver can handle lists/arrays for IN clauses if passed as parameters
         
-        query = f"""
+        query = """
         SELECT 
             ts, src_ip, dst_ip, src_port, dst_port, info, length
         FROM packets 
-        WHERE pcap_id = '{file_id}' AND protocol IN ('{proto_list}')
+        WHERE pcap_id = {file_id:String} AND protocol IN {protocols:Array(String)}
         ORDER BY ts DESC
         LIMIT 500
         """
-        result = ch_client.query(query)
+        result = ch_client.query(query, parameters={'file_id': file_id, 'protocols': protocols})
         
         packets = []
         for row in result.result_rows:
