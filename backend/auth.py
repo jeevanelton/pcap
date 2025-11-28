@@ -30,7 +30,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 
 
 def get_user_by_email(email: str):
-    res = get_ch_client().query(f"SELECT id, email, password_hash, created_at FROM users WHERE email = '{email}' LIMIT 1")
+    res = get_ch_client().query("SELECT id, email, password_hash, created_at FROM users WHERE email = {email:String} LIMIT 1", parameters={'email': email})
     if res.result_rows:
         row = res.result_rows[0]
         return {"id": str(row[0]), "email": row[1], "password_hash": row[2], "created_at": row[3]}
@@ -38,7 +38,7 @@ def get_user_by_email(email: str):
 
 
 def get_user_by_id(user_id: str):
-    res = get_ch_client().query(f"SELECT id, email, password_hash, created_at FROM users WHERE id = '{user_id}' LIMIT 1")
+    res = get_ch_client().query("SELECT id, email, password_hash, created_at FROM users WHERE id = {user_id:String} LIMIT 1", parameters={'user_id': user_id})
     if res.result_rows:
         row = res.result_rows[0]
         return {"id": str(row[0]), "email": row[1], "password_hash": row[2], "created_at": row[3]}
