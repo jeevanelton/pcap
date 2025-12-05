@@ -68,11 +68,16 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 ANALYSIS_PROGRESS: Dict[str, Dict[str, Any]] = {}
 
 # Lightweight proxy so scattered ch_client usages route to the cached client
+# NOTE: This proxy is dangerous with the new get_ch_client() which returns a NEW client every time.
+# We should update the code to call get_ch_client() directly instead of using this global proxy.
+# But for now, let's make the proxy create a new client for each call to be safe.
 class _CHProxy:
     def query(self, *args, **kwargs):
-        return get_ch_client().query(*args, **kwargs)
+        with get_ch_client() as client:
+            return client.query(*args, **kwargs)
     def command(self, *args, **kwargs):
-        return get_ch_client().command(*args, **kwargs)
+        with get_ch_client() as client:
+            return client.command(*args, **kwargs)
 
 ch_client = _CHProxy()
 
@@ -376,6 +381,11 @@ async def delete_pcap_file(file_id: str, current_user: dict = Depends(get_curren
 async def analyze_pcap(file_id: str, current_user: dict = Depends(get_current_user)):
     """Analyze PCAP data from ClickHouse and return statistics."""
     try:
+        try:
+            uuid.UUID(file_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid File ID")
+
         # Get total packets and bytes from metadata
         metadata_result = get_ch_client().query("SELECT total_packets, file_size, capture_duration FROM pcap_metadata WHERE id = {pcap_id:String}", parameters={'pcap_id': file_id})
         if not metadata_result.result_rows:
@@ -462,6 +472,11 @@ async def overview(file_id: str, current_user: dict = Depends(get_current_user))
     Lightweight aggregates only (no deep inspection parsing yet).
     """
     try:
+        try:
+            uuid.UUID(file_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid File ID")
+
         # Basic metadata
         print(f"Executing meta query for file_id: {file_id}")
         meta = get_ch_client().query(
@@ -546,9 +561,10 @@ async def overview(file_id: str, current_user: dict = Depends(get_current_user))
         top_ports = [{"port": int(r[0]), "count": r[1]} for r in top_ports_q.result_rows]
 
         categories = {
-            "dns": protocols.get("DNS", 0) + protocols.get("mDNS", 0) + protocols.get("LLMNR", 0) + protocols.get("NBNS", 0),
-            "http": protocols.get("HTTP", 0),
-            "ssl": protocols.get("TLS", 0),
+            "dns": protocols.get("DNS", 0),
+            "http": protocols.get("HTTP", 0) + protocols.get("HTTP/XML", 0),
+            "tls": protocols.get("TLS", 0) + protocols.get("SSL", 0),
+            "ssh": protocols.get("SSH", 0),
             "quic": protocols.get("QUIC", 0),
             "smb": protocols.get("SMB", 0) + protocols.get("NBNS", 0),
             "arp": protocols.get("ARP", 0),
@@ -590,6 +606,11 @@ async def overview(file_id: str, current_user: dict = Depends(get_current_user))
 async def get_packets(file_id: str, limit: int = 1000, offset: int = 0, current_user: dict = Depends(get_current_user)):
     """Get packet details from ClickHouse with pagination. Default limit increased to 1000 for better UX."""
     try:
+        try:
+            uuid.UUID(file_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid File ID")
+
         # Cap max limit to prevent memory issues
         limit = min(limit, 10000)
         
@@ -636,6 +657,11 @@ SELECT
 async def get_packet_detail(file_id: str, packet_number: int, current_user: dict = Depends(get_current_user)):
     """Get full details for a single packet from ClickHouse."""
     try:
+        try:
+            uuid.UUID(file_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid File ID")
+
         query = """
 SELECT 
     ts, pcap_id, packet_number, src_ip, dst_ip, src_port, dst_port, protocol, length, file_offset, info, layers_json 
@@ -692,7 +718,9 @@ SELECT
     src_ip, dst_ip, COUNT() AS packets, SUM(length) AS bytes
 FROM packets 
 WHERE pcap_id = {pcap_id:String} 
-GROUP BY src_ip, dst_ip""", parameters={'pcap_id': file_id})
+GROUP BY src_ip, dst_ip
+ORDER BY packets DESC
+LIMIT 300""", parameters={'pcap_id': file_id})
         
         nodes = []
         edges = []
@@ -1195,85 +1223,91 @@ async def dns_security(file_id: str, current_user: dict = Depends(get_current_us
         raise HTTPException(status_code=500, detail=f"Failed to compute DNS security metrics: {e}")
 
 @app.get("/api/details/http/{file_id}")
-async def get_http_details(file_id: str, current_user: dict = Depends(get_current_user)):
-    """Get detailed HTTP request/response information."""
+async def get_http_details(
+    file_id: str, 
+    limit: int = 100, 
+    offset: int = 0, 
+    current_user: dict = Depends(get_current_user)
+):
+    """Get detailed HTTP request/response information from http_log."""
     try:
+        limit = min(limit, 1000)
+        
+        # Get total count
+        count_query = f"SELECT COUNT() FROM http_log WHERE pcap_id = '{file_id}'"
+        total_count = ch_client.query(count_query).result_rows[0][0]
+
+        # Get paginated results
         query = f"""
         SELECT 
-            ts, src_ip, dst_ip, src_port, dst_port, info, layers_json
-        FROM packets 
-        WHERE pcap_id = '{file_id}' AND protocol = 'HTTP'
+            ts, id_orig_h, id_orig_p, id_resp_h, id_resp_p, 
+            method, host, uri, user_agent, status_code
+        FROM http_log 
+        WHERE pcap_id = '{file_id}'
         ORDER BY ts DESC
-        LIMIT 500
+        LIMIT {limit} OFFSET {offset}
         """
         result = ch_client.query(query)
         
-        http_requests = []
-        methods = {}
-        hosts = {}
-        user_agents = {}
-        status_codes = {}
-        
+        http_transactions = []
         for row in result.result_rows:
-            ts, src_ip, dst_ip, src_port, dst_port, info, layers_json_str = row
-            
-            try:
-                layers = json.loads(layers_json_str) if layers_json_str else []
-                http_layer = next((l for l in layers if l.get('name', '').lower() == 'http'), None)
-                
-                if http_layer:
-                    fields = http_layer.get('fields', {})
-                    method = fields.get('http.request.method', fields.get('http.response.code', 'Unknown'))
-                    host = fields.get('http.host', 'Unknown')
-                    user_agent = fields.get('http.user_agent', 'Unknown')
-                    uri = fields.get('http.request.uri', '')
-                    
-                    http_requests.append({
-                        "time": ts.isoformat(),
-                        "source": f"{src_ip}:{src_port}",
-                        "destination": f"{dst_ip}:{dst_port}",
-                        "method": method,
-                        "host": host,
-                        "uri": uri,
-                        "user_agent": user_agent,
-                        "info": info
-                    })
-                    
-                    if method.isdigit():  # Response code
-                        status_codes[method] = status_codes.get(method, 0) + 1
-                    else:
-                        methods[method] = methods.get(method, 0) + 1
-                    
-                    if host != 'Unknown':
-                        hosts[host] = hosts.get(host, 0) + 1
-                    if user_agent != 'Unknown':
-                        user_agents[user_agent] = user_agents.get(user_agent, 0) + 1
-            except:
-                http_requests.append({
-                    "time": ts.isoformat(),
-                    "source": f"{src_ip}:{src_port}",
-                    "destination": f"{dst_ip}:{dst_port}",
-                    "method": "Unknown",
-                    "host": "Unknown",
-                    "uri": "",
-                    "user_agent": "Unknown",
-                    "info": info
-                })
-        
-        top_hosts = sorted(hosts.items(), key=lambda x: x[1], reverse=True)[:20]
-        top_user_agents = sorted(user_agents.items(), key=lambda x: x[1], reverse=True)[:10]
-        
+            ts, src_ip, src_port, dst_ip, dst_port, method, host, uri, ua, status = row
+            http_transactions.append({
+                "time": ts.isoformat(),
+                "source": f"{src_ip}:{src_port}",
+                "destination": f"{dst_ip}:{dst_port}",
+                "method": method,
+                "host": host,
+                "uri": uri,
+                "user_agent": ua,
+                "status_code": status
+            })
+
+        # Global Stats
+        # Status Codes
+        status_query = f"""
+        SELECT status_code, COUNT() 
+        FROM http_log 
+        WHERE pcap_id = '{file_id}'
+        GROUP BY status_code
+        """
+        status_res = ch_client.query(status_query).result_rows
+        status_codes = {str(r[0]): r[1] for r in status_res}
+
+        # Methods
+        method_query = f"""
+        SELECT method, COUNT()
+        FROM http_log
+        WHERE pcap_id = '{file_id}'
+        GROUP BY method
+        """
+        method_res = ch_client.query(method_query).result_rows
+        methods = {r[0]: r[1] for r in method_res}
+
+        # Top Hosts
+        host_query = f"""
+        SELECT host, COUNT() as c
+        FROM http_log
+        WHERE pcap_id = '{file_id}' AND host != ''
+        GROUP BY host
+        ORDER BY c DESC
+        LIMIT 10
+        """
+        host_res = ch_client.query(host_query).result_rows
+        top_hosts = [{"host": r[0], "count": r[1]} for r in host_res]
+
         return {
-            "total": len(http_requests),
-            "requests": http_requests[:100],
+            "total": total_count,
+            "requests": http_transactions,
             "methods": methods,
             "status_codes": status_codes,
-            "top_hosts": [{"host": h[0], "count": h[1]} for h in top_hosts],
-            "top_user_agents": [{"user_agent": ua[0], "count": ua[1]} for ua in top_user_agents]
+            "top_hosts": top_hosts,
+            "has_more": (offset + limit) < total_count,
+            "next_offset": offset + limit if (offset + limit) < total_count else None
         }
     except Exception as e:
+        print(f"Error getting HTTP details: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get HTTP details: {e}")
-
 
 @app.get("/api/details/tls/{file_id}")
 async def get_tls_details(file_id: str, current_user: dict = Depends(get_current_user)):
@@ -1370,11 +1404,11 @@ async def get_open_ports_details(file_id: str, current_user: dict = Depends(get_
             21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS",
             80: "HTTP", 110: "POP3", 143: "IMAP", 443: "HTTPS", 3306: "MySQL",
             3389: "RDP", 5432: "PostgreSQL", 6379: "Redis", 8080: "HTTP-Alt", 27017: "MongoDB"
-        }
+        };
         
         for row in result.result_rows:
             port, protocol, connections, unique_src, unique_dst, total_bytes = row
-            service = port_services.get(port, "Unknown")
+            service = port_services.get(port, "Unknown");
             
             ports_data.append({
                 "port": port,
@@ -1384,7 +1418,7 @@ async def get_open_ports_details(file_id: str, current_user: dict = Depends(get_
                 "unique_sources": unique_src,
                 "unique_destinations": unique_dst,
                 "bytes": total_bytes
-            })
+            });
         
         return {
             "total_ports": len(ports_data),

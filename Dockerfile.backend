@@ -2,10 +2,16 @@ FROM python:3.12-slim
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
+    curl \
+    gpg \
+    && echo 'deb http://download.opensuse.org/repositories/security:/zeek/Debian_12/ /' | tee /etc/apt/sources.list.d/security:zeek.list && \
+    curl -fsSL https://download.opensuse.org/repositories/security:/zeek/Debian_12/Release.key | gpg --dearmor | tee /etc/apt/trusted.gpg.d/security_zeek.gpg > /dev/null && \
+    apt-get update && apt-get install -y \
     tshark \
     libpcap-dev \
     wget \
     inotify-tools \
+    zeek \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory

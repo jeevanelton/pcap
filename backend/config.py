@@ -13,7 +13,10 @@ CH_PORT = int(
 	or os.getenv("CLICKHOUSE_PORT", 8123)
 )
 CH_USER = os.getenv("CH_USER") or os.getenv("CLICKHOUSE_USER", "default")
-CH_PASSWORD = os.getenv("CH_PASSWORD") or os.getenv("CLICKHOUSE_PASSWORD", "password")
+CH_PASSWORD = os.getenv("CH_PASSWORD")
+if CH_PASSWORD is None:
+    CH_PASSWORD = os.getenv("CLICKHOUSE_PASSWORD", "password")
+
 CH_DATABASE = (
 	os.getenv("CH_DATABASE")
 	or os.getenv("CLICKHOUSE_DATABASE")

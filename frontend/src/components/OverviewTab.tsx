@@ -1,8 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import './OverviewTab.css';
 import { API_BASE_URL } from '../config';
-import FeatureDetailModal from './FeatureDetailModal';
+import { ProtocolView } from './ProtocolView';
 import DnsView from './DnsView';
+import { HttpAnalysisView } from './HttpAnalysisView';
 
 const API_BASE = API_BASE_URL;
 
@@ -50,8 +51,7 @@ const OverviewTab: React.FC<{ fileId: string }>= ({ fileId }) => {
   const [data, setData] = useState<OverviewData | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [selectedFeature, setSelectedFeature] = useState<CardSpec | null>(null);
-  const [showDnsView, setShowDnsView] = useState(false);
+  const [activeView, setActiveView] = useState<string | null>(null);
 
   useEffect(() => {
     if (!fileId) return;
@@ -68,12 +68,14 @@ const OverviewTab: React.FC<{ fileId: string }>= ({ fileId }) => {
   const handleCardClick = (card: CardSpec) => {
     const has = (card.dependsOn||[]).every(proto => data?.protocols[proto] !== undefined);
     if (!has) return;
-    if (card.key === 'dns') {
-      setShowDnsView(true);
-    } else {
-      setSelectedFeature(card);
-    }
+    setActiveView(card.key);
   };
+
+  if (activeView) {
+    return <FeatureView featureKey={activeView} fileId={fileId} onBack={() => setActiveView(null)} />;
+  }
+
+
 
   const totalProtocols = data ? Object.keys(data.protocols).length : 0;
 
@@ -94,7 +96,7 @@ const OverviewTab: React.FC<{ fileId: string }>= ({ fileId }) => {
       <section className="mt-8 grid gap-4 overview-grid">
         {cards.map(c => {
           const has = (c.dependsOn||[]).every(proto => data.protocols[proto] !== undefined);
-          return <div key={c.key} onClick={() => handleCardClick(c)} className={`card-tile border border-[#1f2833] rounded-md p-4 bg-[#14181f] flex flex-col ${!has? 'opacity-40':'cursor-not-allowed'}`}> 
+          return <div key={c.key} onClick={() => handleCardClick(c)} className={`card-tile border border-[#1f2833] rounded-md p-4 bg-[#14181f] flex flex-col ${!has? 'opacity-40':'cursor-pointer hover:border-cyan-400 transition-colors'}`}> 
             <div className="flex items-center justify-between mb-2">
               <span className="font-semibold text-sm">{c.title}</span>
               <span className="text-xs px-2 py-0.5 rounded bg-[#1f2833]">{has? (data.categories[c.key] ?? 'Ready') : 'N/A'}</span>
@@ -108,25 +110,7 @@ const OverviewTab: React.FC<{ fileId: string }>= ({ fileId }) => {
         })}
       </section>
     </>}
-    {showDnsView && (
-      <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm p-6 overflow-y-auto">
-        <div className="bg-white rounded-2xl shadow-2xl max-w-7xl mx-auto p-6 space-y-6">
-          <div className="flex items-center justify-between mb-2">
-            <h2 className="text-2xl font-bold text-gray-900">DNS Analytics</h2>
-            <button onClick={() => setShowDnsView(false)} className="px-3 py-1.5 text-sm rounded-lg bg-gray-200 hover:bg-gray-300 text-gray-800">Close</button>
-          </div>
-          <DnsView fileId={fileId} />
-        </div>
-      </div>
-    )}
-    {selectedFeature && !showDnsView && (
-      <FeatureDetailModal
-        featureKey={selectedFeature.key}
-        featureTitle={selectedFeature.title}
-        fileId={fileId}
-        onClose={() => setSelectedFeature(null)}
-      />
-    )}
+
   </div>;
 };
 
@@ -164,6 +148,62 @@ const ProtocolChart: React.FC<{ points: TrafficPoint[] }> = ({ points }) => {
       return <text key={i} x={8} y={y+3} fontSize={9} fill="#6e7681">{val}</text>;
     })}
   </svg>;
+};
+
+// Feature View Component - Full page view for each feature
+const FeatureView: React.FC<{ featureKey: string; fileId: string; onBack: () => void }> = ({ featureKey, fileId, onBack }) => {
+  const card = cards.find(c => c.key === featureKey);
+  const title = card?.title || featureKey;
+  const description = card?.description || '';
+
+  // Map feature keys to their protocols for the API
+  const protocolMap: Record<string, string> = {
+    'http': 'HTTP',
+    'ssl': 'TLS',
+    'smb': 'SMB,NBNS',
+    'arp': 'ARP',
+    'telnet': 'Telnet',
+    'ftp': 'FTP',
+    'ssdp': 'SSDP',
+    'sip': 'SIP',
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm p-6 overflow-y-auto">
+      <div className="bg-white rounded-2xl shadow-2xl max-w-7xl mx-auto p-6 space-y-6">
+        <div className="flex items-center justify-between mb-2">
+          <div>
+            <h2 className="text-2xl font-bold text-gray-900">{title}</h2>
+            {description && <p className="text-sm text-gray-600 mt-1">{description}</p>}
+          </div>
+          <button 
+            onClick={onBack} 
+            className="px-3 py-1.5 text-sm rounded-lg bg-gray-200 hover:bg-gray-300 text-gray-800"
+          >
+            Back to Overview
+          </button>
+        </div>
+
+        {featureKey === 'dns' ? (
+          <DnsView fileId={fileId} />
+        ) : featureKey === 'http' ? (
+          <HttpAnalysisView fileId={fileId} />
+        ) : protocolMap[featureKey] ? (
+          <ProtocolView 
+            fileId={fileId} 
+            protocol={protocolMap[featureKey]} 
+            title={title}
+            description={description}
+          />
+        ) : (
+          <div className="text-center py-12">
+            <p className="text-gray-600">This feature view is not yet implemented.</p>
+            <p className="text-sm text-gray-500 mt-2">Feature: {featureKey}</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
 };
 
 export default OverviewTab;

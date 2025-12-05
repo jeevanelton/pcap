@@ -112,10 +112,10 @@ const FeatureDetailModal: React.FC<FeatureDetailModalProps> = ({ featureKey, fea
   };
 
   return (
-    <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-6xl max-h-[90vh] flex flex-col">
+    <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm p-6 overflow-y-auto">
+      <div className="bg-white rounded-2xl shadow-2xl max-w-7xl mx-auto p-6 space-y-6 min-h-[80vh]">
         {/* Header */}
-        <div className="flex items-center justify-between p-6 border-b border-gray-200 bg-gradient-to-r from-indigo-50 to-purple-50">
+        <div className="flex items-center justify-between mb-6 border-b border-gray-200 pb-4">
           <div>
             <h2 className="text-2xl font-bold text-gray-900">{featureTitle}</h2>
             <p className="text-sm text-gray-600 mt-1">
@@ -142,16 +142,18 @@ const FeatureDetailModal: React.FC<FeatureDetailModalProps> = ({ featureKey, fea
             </button>
             <button
               onClick={onClose}
-              className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
+              className="px-3 py-1.5 text-sm rounded-lg bg-gray-200 hover:bg-gray-300 text-gray-800"
             >
-              <X className="h-6 w-6 text-gray-600" />
+              Close
             </button>
           </div>
         </div>
 
         {/* Content */}
-        <div className="flex-1 overflow-y-auto p-6">
-          {renderContent()}
+        <div className="flex-1 overflow-y-auto">
+          <div className="p-6">
+            {renderContent()}
+          </div>
         </div>
       </div>
     </div>

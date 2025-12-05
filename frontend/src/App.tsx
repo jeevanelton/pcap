@@ -5,7 +5,7 @@ import { Charts } from '@/components/Charts';
 import WiresharkViewer from '@/components/WiresharkViewer';
 import NetworkGraph from '@/components/NetworkGraph';
 import GeoMap from '@/components/GeoMap';
-import FeatureDetailModal from '@/components/FeatureDetailModal';
+
 import DnsView from '@/components/DnsView';
 import { ShieldCheck, Upload } from 'lucide-react';
 import { useAuth, authFetch } from './contexts/AuthContext';
@@ -22,8 +22,29 @@ import { CARD_SPECS } from '@/config/constants';
 import { AnalysisData, PacketsData, OverviewData } from '@/types/api';
 import { ProtocolView } from '@/components/ProtocolView';
 import { AnalysisView } from '@/components/AnalysisView';
+import { HttpAnalysisView } from '@/components/HttpAnalysisView';
 
 const API_BASE = API_BASE_URL;
+
+const CARD_TO_TAB: Record<string, string> = {
+  'dns': 'DNS',
+  'http': 'HTTP',
+  'ssl': 'SSL/TLS',
+  'tcp': 'TCP',
+  'icmp': 'ICMP',
+  'dhcp': 'DHCP',
+  'smb': 'SMB',
+  'arp': 'ARP',
+  'sip': 'SIP',
+  'telnet': 'Telnet',
+  'ftp': 'FTP',
+  'ssdp': 'SSDP',
+  'open_ports': 'Open Ports',
+  'connections': 'Connections',
+  'hosts': 'Hosts',
+  'servers': 'Servers',
+  'credentials': 'Credentials',
+};
 
 // Protocol Chart Component
 interface TrafficPoint { time: string; packets: number; }
@@ -73,7 +94,7 @@ function App() {
   const [activeTab, setActiveTab] = useState('Dashboard');
   const [isUploadModalOpen, setUploadModalOpen] = useState(false);
   const [isLoadingProject, setIsLoadingProject] = useState(false);
-  const [selectedFeature, setSelectedFeature] = useState<{ key: string; title: string } | null>(null);
+
 
   useEffect(() => {
     if (projectId) {
@@ -200,7 +221,7 @@ function App() {
                   <p className="text-sm text-gray-500">Real-time protocol distribution and traffic volume</p>
                 </div>
               </div>
-              
+
               <div style={{ height: '400px' }}>
                 <Charts analysisData={analysisData} chartType="stackedArea" />
               </div>
@@ -221,11 +242,9 @@ function App() {
                         className={`card-tile border border-gray-200 rounded-md p-4 bg-gray-50 flex flex-col ${!has ? 'opacity-40' : ''} ${hasData && isImplemented ? 'cursor-pointer hover:shadow-lg hover:border-indigo-300 transition-all' : ''}`}
                         onClick={() => {
                           if (hasData && isImplemented) {
-                            if (c.key === 'dns') {
-                              // Prefer dedicated DNS tab
-                              setActiveTab('DNS');
-                            } else {
-                              setSelectedFeature({ key: c.key, title: c.title });
+                            const targetTab = CARD_TO_TAB[c.key];
+                            if (targetTab) {
+                              setActiveTab(targetTab);
                             }
                           }
                         }}
@@ -319,10 +338,10 @@ function App() {
             </div>
           </div>
         );
-      
+
       // Protocol Tabs
       case 'HTTP':
-        return <ProtocolView fileId={fileId} protocol="HTTP" title="HTTP Traffic" description="Hypertext Transfer Protocol requests and responses." />;
+        return <HttpAnalysisView fileId={fileId} />;
       case 'SSL/TLS':
         return <ProtocolView fileId={fileId} protocol="TLS" title="SSL/TLS Traffic" description="Encrypted traffic handshakes and application data." />;
       case 'TCP':
@@ -376,14 +395,6 @@ function App() {
         setPacketsData={setPacketsData}
         setOverviewData={setOverviewData}
       />
-      {selectedFeature && fileId && (
-        <FeatureDetailModal
-          featureKey={selectedFeature.key}
-          featureTitle={selectedFeature.title}
-          fileId={fileId}
-          onClose={() => setSelectedFeature(null)}
-        />
-      )}
       <div className="flex flex-1 h-[calc(100vh-64px)] overflow-hidden">
         <TabNav
           activeTab={activeTab}
